@@ -11,6 +11,7 @@
 #include <hardware/gralloc1.h>
 #endif
 
+#include <android/hardware_buffer.h>
 #include <hardware/hardware.h>
 #include <hardware/hwvulkan.h>
 

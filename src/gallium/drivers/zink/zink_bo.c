@@ -35,11 +35,6 @@
 #include "zink_screen.h"
 #include "util/u_hash_table.h"
 
-#if !defined(__APPLE__) && !defined(_WIN32)
-#define ZINK_USE_DMABUF
-#include <xf86drm.h>
-#endif
-
 struct zink_bo;
 
 struct zink_sparse_backing_chunk {

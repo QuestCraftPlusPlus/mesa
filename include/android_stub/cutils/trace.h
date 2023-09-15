@@ -134,27 +134,18 @@ extern int atrace_marker_fd;
  * This can be explicitly run to avoid setup delay on first trace function.
  */
 #define ATRACE_INIT() atrace_init()
-#define ATRACE_GET_ENABLED_TAGS() atrace_get_enabled_tags()
 
-void atrace_init();
-uint64_t atrace_get_enabled_tags();
-
-/**
- * Test if a given tag is currently enabled.
- * Returns nonzero if the tag is enabled, otherwise zero.
- * It can be used as a guard condition around more expensive trace calculations.
- */
 #define ATRACE_ENABLED() atrace_is_tag_enabled(ATRACE_TAG)
 static inline uint64_t atrace_is_tag_enabled(uint64_t tag)
 {
-    return atrace_get_enabled_tags() & tag;
+    return 0;
 }
 
 /**
  * Trace the beginning of a context.  name is used to identify the context.
  * This is often used to time function execution.
  */
-#define ATRACE_BEGIN(name) atrace_begin(ATRACE_TAG, name)
+#define ATRACE_BEGIN(name) atrace_begin(ATRACE_TAG, name)z
 static inline void atrace_begin(uint64_t tag, const char* name)
 {
     if (CC_UNLIKELY(atrace_is_tag_enabled(tag))) {
