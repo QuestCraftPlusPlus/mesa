@@ -59,6 +59,7 @@ with_glcpp_tests = get_option('enable-glcpp-tests')
 with_aco_tests = get_option('build-aco-tests')
 with_glx_read_only_text = get_option('glx-read-only-text')
 with_glx_direct = get_option('glx-direct')
+with_glx_fake = get_option('glx-fake')
 with_osmesa = get_option('osmesa')
 with_vulkan_overlay_layer = get_option('vulkan-layers').contains('overlay')
 with_vulkan_device_select_layer = get_option('vulkan-layers').contains('device-select')
@@ -121,7 +122,7 @@ with_any_opengl = with_opengl or with_gles1 or with_gles2
 # Only build shared_glapi if at least one OpenGL API is enabled
 with_shared_glapi = with_shared_glapi and with_any_opengl
 
-system_has_kms_drm = ['openbsd', 'netbsd', 'freebsd', 'gnu/kfreebsd', 'dragonfly', 'linux', 'sunos', 'android'].contains(host_machine.system())
+system_has_kms_drm = true
 
 gallium_drivers = get_option('gallium-drivers')
 if gallium_drivers.contains('auto')
@@ -466,8 +467,8 @@ if not have_mtls_dialect
 endif
 
 if with_glx != 'disabled'
-  if not (with_platform_x11 and with_any_opengl)
-    error('Cannot build GLX support without X11 platform support and at least one OpenGL API')
+  if not ((with_platform_x11 or with_glx_fake) and with_any_opengl)
+    warning('Cannot build GLX support without X11 platform support and at least one OpenGL API')
   elif with_glx == 'xlib'
     if not with_gallium
       error('xlib based GLX requires at least one gallium driver')
@@ -1925,9 +1926,6 @@ if dep_unwind.found()
 endif
 
 if with_osmesa
-  if not with_gallium_softpipe
-    error('OSMesa gallium requires gallium softpipe or llvmpipe.')
-  endif
   if host_machine.system() == 'windows'
     osmesa_lib_name = 'osmesa'
   else

@@ -766,10 +766,25 @@ init_ici(struct zink_screen *screen, VkImageCreateInfo *ici, const struct pipe_r
       ici->arrayLayers *= 6;
 }
 
+static int getDMABuf() {
+	FILE *fptr;
+	fptr = fopen("dmabuf", "r");
+	if(fptr == NULL) {
+		return 0;
+	}
+	char myString[100];
+	fgets(myString, 100, fptr);
+	fclose(fptr);
+	mesa_logi("ZINK: DMABuf is %s", myString);
+
+	return atoi(myString);
+}
+
 static struct zink_resource_object *
 resource_object_create(struct zink_screen *screen, const struct pipe_resource *templ, struct winsys_handle *whandle, bool *linear,
                        uint64_t *modifiers, int modifiers_count, const void *loader_private, const void *user_mem)
 {
+   int dmaBuf = getDMABuf();
    struct zink_resource_object *obj = CALLOC_STRUCT(zink_resource_object);
    unsigned max_level = 0;
    if (!obj)
@@ -946,12 +961,15 @@ resource_object_create(struct zink_screen *screen, const struct pipe_resource *t
 
       obj->render_target = (ici.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) != 0;
 
-      if (shared || external) {
+      if (shared || external || dmaBuf != 0) {
          emici.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
          emici.pNext = ici.pNext;
-         emici.handleTypes = export_types;
+         emici.handleTypes = dmaBuf != 0 ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT : export_types;
          ici.pNext = &emici;
-
+		 if(dmaBuf != 0) {
+			ici.tiling = VK_IMAGE_TILING_LINEAR;
+		 }
+		
          assert(ici.tiling != VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT || mod != DRM_FORMAT_MOD_INVALID);
          if (whandle && ici.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT) {
             assert(mod == whandle->modifier || !winsys_modifier);
@@ -1161,7 +1179,7 @@ resource_object_create(struct zink_screen *screen, const struct pipe_resource *t
    enum zink_alloc_flag aflags = templ->flags & PIPE_RESOURCE_FLAG_SPARSE ? ZINK_ALLOC_SPARSE : 0;
    mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
    mai.pNext = NULL;
-   mai.allocationSize = reqs.size;
+   mai.allocationSize = dmaBuf > -1 ? lseek(dmaBuf, 0, SEEK_END) : reqs.size;
    enum zink_heap heap = zink_heap_from_domain_flags(flags, aflags);
 
    VkMemoryDedicatedAllocateInfo ded_alloc_info = {
@@ -1194,10 +1212,10 @@ resource_object_create(struct zink_screen *screen, const struct pipe_resource *t
       NULL,
    };
 
-   if (whandle) {
+   if (dmaBuf != 0 || whandle) {
       imfi.pNext = NULL;
-      imfi.handleType = external;
-      imfi.fd = os_dupfd_cloexec(whandle->handle);
+      imfi.handleType = dmaBuf != 0 ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT : external;
+      imfi.fd = dmaBuf != 0 ? dmaBuf : os_dupfd_cloexec(whandle->handle);
       if (imfi.fd < 0) {
          mesa_loge("ZINK: failed to dup dmabuf fd: %s\n", strerror(errno));
          goto fail1;
