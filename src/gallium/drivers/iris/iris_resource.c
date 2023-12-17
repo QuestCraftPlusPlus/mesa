@@ -39,6 +39,7 @@
 #include "util/u_inlines.h"
 #include "util/format/u_format.h"
 #include "util/u_memory.h"
+#include "util/u_resource.h"
 #include "util/u_threaded_context.h"
 #include "util/u_transfer.h"
 #include "util/u_transfer_helper.h"
@@ -861,7 +862,10 @@ iris_resource_configure_aux(struct iris_screen *screen,
    if (has_mcs) {
       assert(!res->mod_info);
       assert(!has_hiz);
-      if (has_ccs) {
+      /* We are seeing failures with CCS compression on top of MSAA
+       * compression, so just enable MSAA compression for now on DG2.
+       */
+      if (!intel_device_info_is_dg2(devinfo) && has_ccs) {
          res->aux.usage = ISL_AUX_USAGE_MCS_CCS;
       } else {
          res->aux.usage = ISL_AUX_USAGE_MCS;
@@ -1007,21 +1011,6 @@ iris_resource_init_aux_buf(struct iris_screen *screen,
              0, res->aux.extra_aux.surf.size_B);
    }
 
-   unsigned clear_color_size = iris_get_aux_clear_color_state_size(screen, res);
-   if (clear_color_size > 0) {
-      if (iris_bo_mmap_mode(res->bo) != IRIS_MMAP_NONE) {
-         if (!map)
-            map = iris_bo_map(NULL, res->bo, MAP_WRITE | MAP_RAW);
-         if (!map)
-            return false;
-
-         /* Zero the indirect clear color to match ::fast_clear_color. */
-         memset((char *)map + res->aux.clear_color_offset, 0, clear_color_size);
-      } else {
-         res->aux.clear_color_unknown = true;
-      }
-   }
-
    if (map)
       iris_bo_unmap(res->bo);
 
@@ -1031,9 +1020,10 @@ iris_resource_init_aux_buf(struct iris_screen *screen,
       map_aux_addresses(screen, res, res->internal_format, 0);
    }
 
-   if (clear_color_size > 0) {
+   if (iris_get_aux_clear_color_state_size(screen, res) > 0) {
       res->aux.clear_color_bo = res->bo;
       iris_bo_reference(res->aux.clear_color_bo);
+      res->aux.clear_color_unknown = !res->aux.clear_color_bo->zeroed;
    }
 
    return true;
@@ -1437,19 +1427,6 @@ mod_plane_is_clear_color(uint64_t modifier, uint32_t plane)
    }
 }
 
-static struct iris_resource *
-get_resource_for_plane(struct pipe_resource *resource,
-                       unsigned plane)
-{
-   unsigned count = 0;
-   for (struct pipe_resource *cur = resource; cur; cur = cur->next) {
-      if (count++ == plane)
-         return (struct iris_resource *)cur;
-   }
-
-   return NULL;
-}
-
 static unsigned
 get_num_planes(const struct pipe_resource *resource)
 {
@@ -1487,8 +1464,6 @@ iris_resource_from_handle(struct pipe_screen *pscreen,
                           struct winsys_handle *whandle,
                           unsigned usage)
 {
-   assert(templ->target != PIPE_BUFFER);
-
    struct iris_screen *screen = (struct iris_screen *)pscreen;
    struct iris_bufmgr *bufmgr = screen->bufmgr;
    struct iris_resource *res = iris_alloc_resource(pscreen, templ);
@@ -1522,6 +1497,11 @@ iris_resource_from_handle(struct pipe_screen *pscreen,
 
    res->offset = whandle->offset;
    res->external_format = whandle->format;
+
+   if (templ->target == PIPE_BUFFER) {
+      res->surf.tiling = ISL_TILING_LINEAR;
+      return &res->base.b;
+   }
 
    /* Create a surface for each plane specified by the external format. */
    if (whandle->plane < util_format_get_num_planes(whandle->format)) {
@@ -1721,6 +1701,10 @@ iris_reallocate_resource_inplace(struct iris_context *ice,
    }
 
    iris_flush_resource(&ice->ctx, &new_res->base.b);
+   iris_foreach_batch(ice, batch) {
+      if (iris_batch_references(batch, new_res->bo))
+         iris_batch_flush(batch);
+   }
 
    struct iris_bo *old_bo = old_res->bo;
    struct iris_bo *old_aux_bo = old_res->aux.bo;
@@ -1831,7 +1815,8 @@ iris_resource_get_param(struct pipe_screen *pscreen,
    struct iris_resource *base_res = (struct iris_resource *)resource;
    unsigned main_plane = get_main_plane_for_plane(base_res->external_format,
                                                   base_res->mod_info, plane);
-   struct iris_resource *res = get_resource_for_plane(resource, main_plane);
+   struct iris_resource *res =
+      (struct iris_resource *)util_resource_at_index(resource, main_plane);
    assert(res);
 
    bool mod_with_aux =

@@ -500,28 +500,6 @@ st_link_glsl_to_nir(struct gl_context *ctx,
 
    assert(shader_program->data->LinkStatus);
 
-   /* Skip the GLSL steps when using SPIR-V. */
-   if (!shader_program->data->spirv) {
-      for (unsigned i = 0; i < MESA_SHADER_STAGES; i++) {
-         if (shader_program->_LinkedShaders[i] == NULL)
-            continue;
-
-         struct gl_linked_shader *shader = shader_program->_LinkedShaders[i];
-         exec_list *ir = shader->ir;
-
-         lower_packing_builtins(ir, ctx->Extensions.ARB_shading_language_packing,
-                                ctx->Extensions.ARB_gpu_shader5,
-                                ctx->st->has_half_float_packing);
-         do_mat_op_to_vec(ir);
-
-         lower_instructions(ir, ctx->Extensions.ARB_gpu_shader5);
-
-         do_vec_index_to_cond_assign(ir);
-
-         validate_ir_tree(ir);
-      }
-   }
-
    for (unsigned i = 0; i < MESA_SHADER_STAGES; i++) {
       if (shader_program->_LinkedShaders[i])
          linked_shader[num_shaders++] = shader_program->_LinkedShaders[i];
@@ -545,8 +523,6 @@ st_link_glsl_to_nir(struct gl_context *ctx,
       if (shader_program->data->spirv) {
          prog->nir = _mesa_spirv_to_nir(ctx, shader_program, shader->Stage, options);
       } else {
-         validate_ir_tree(shader->ir);
-
          if (ctx->_Shader->Flags & GLSL_DUMP) {
             _mesa_log("\n");
             _mesa_log("GLSL IR for linked %s program %d:\n",

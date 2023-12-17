@@ -64,6 +64,9 @@ radv_perf_query_supported(const struct radv_physical_device *pdev)
 static bool
 radv_taskmesh_enabled(const struct radv_physical_device *pdevice)
 {
+   if (pdevice->instance->debug_flags & RADV_DEBUG_NO_MESH_SHADER)
+      return false;
+
    return pdevice->use_ngg && !pdevice->use_llvm && pdevice->rad_info.gfx_level >= GFX10_3 &&
           !(pdevice->instance->debug_flags & RADV_DEBUG_NO_COMPUTE_QUEUE) && pdevice->rad_info.has_gang_submit;
 }
@@ -78,6 +81,13 @@ static bool
 radv_NV_device_generated_commands_enabled(const struct radv_physical_device *device)
 {
    return driQueryOptionb(&device->instance->dri_options, "radv_dgc");
+}
+
+static bool
+radv_calibrated_timestamps_enabled(const struct radv_physical_device *pdevice)
+{
+   return RADV_SUPPORT_CALIBRATED_TIMESTAMPS &&
+          !(pdevice->rad_info.family == CHIP_RAVEN || pdevice->rad_info.family == CHIP_RAVEN2);
 }
 
 static bool
@@ -170,6 +180,9 @@ radv_physical_device_init_queue_table(struct radv_physical_device *pdevice)
          idx++;
       }
    }
+
+   pdevice->vk_queue_to_radv[idx++] = RADV_QUEUE_SPARSE;
+
    pdevice->num_queues = idx;
 }
 
@@ -367,8 +380,16 @@ radv_find_memory_index(const struct radv_physical_device *pdevice, VkMemoryPrope
 static void
 radv_get_binning_settings(const struct radv_physical_device *pdevice, struct radv_binning_settings *settings)
 {
-   settings->context_states_per_bin = 1;
-   settings->persistent_states_per_bin = 1;
+   if ((pdevice->rad_info.has_dedicated_vram && pdevice->rad_info.max_render_backends > 4) ||
+       pdevice->rad_info.gfx_level >= GFX10) {
+      /* Using higher settings on GFX10+ can cause random GPU hangs. */
+      settings->context_states_per_bin = 1;
+      settings->persistent_states_per_bin = 1;
+   } else {
+      settings->context_states_per_bin = pdevice->rad_info.has_gfx9_scissor_bug ? 1 : 3;
+      settings->persistent_states_per_bin = 1;
+   }
+
    settings->fpovs_per_batch = 63;
 }
 
@@ -380,6 +401,7 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device 
       .KHR_8bit_storage = true,
       .KHR_16bit_storage = true,
       .KHR_acceleration_structure = radv_enable_rt(device, false),
+      .KHR_calibrated_timestamps = radv_calibrated_timestamps_enabled(device),
       .KHR_cooperative_matrix = device->rad_info.gfx_level >= GFX11 && !device->use_llvm,
       .KHR_bind_memory2 = true,
       .KHR_buffer_device_address = true,
@@ -456,6 +478,7 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device 
       .KHR_timeline_semaphore = true,
       .KHR_uniform_buffer_standard_layout = true,
       .KHR_variable_pointers = true,
+      .KHR_vertex_attribute_divisor = true,
       .KHR_video_queue = !!(device->instance->perftest_flags & RADV_PERFTEST_VIDEO_DECODE),
       .KHR_video_decode_queue = !!(device->instance->perftest_flags & RADV_PERFTEST_VIDEO_DECODE),
       .KHR_video_decode_h264 = VIDEO_CODEC_H264DEC && !!(device->instance->perftest_flags & RADV_PERFTEST_VIDEO_DECODE),
@@ -468,19 +491,20 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device 
       .EXT_attachment_feedback_loop_layout = true,
       .EXT_border_color_swizzle = device->rad_info.gfx_level >= GFX10,
       .EXT_buffer_device_address = true,
-      .EXT_calibrated_timestamps = RADV_SUPPORT_CALIBRATED_TIMESTAMPS &&
-                                   !(device->rad_info.family == CHIP_RAVEN || device->rad_info.family == CHIP_RAVEN2),
+      .EXT_calibrated_timestamps = radv_calibrated_timestamps_enabled(device),
       .EXT_color_write_enable = true,
       .EXT_conditional_rendering = true,
       .EXT_conservative_rasterization = device->rad_info.gfx_level >= GFX9,
       .EXT_custom_border_color = true,
       .EXT_debug_marker = device->instance->vk.trace_mode & RADV_TRACE_MODE_RGP,
       .EXT_depth_bias_control = true,
+      .EXT_depth_clamp_zero_one = true,
       .EXT_depth_clip_control = true,
       .EXT_depth_clip_enable = true,
       .EXT_depth_range_unrestricted = true,
       .EXT_descriptor_buffer = true,
       .EXT_descriptor_indexing = true,
+      .EXT_device_fault = device->rad_info.has_gpuvm_fault_query,
       .EXT_discard_rectangles = true,
 #ifdef VK_USE_PLATFORM_DISPLAY_KHR
       .EXT_display_control = true,
@@ -498,6 +522,7 @@ radv_physical_device_get_supported_extensions(const struct radv_physical_device 
       .EXT_graphics_pipeline_library = !device->use_llvm && !(device->instance->debug_flags & RADV_DEBUG_NO_GPL),
       .EXT_host_query_reset = true,
       .EXT_image_2d_view_of_3d = true,
+      .EXT_image_compression_control = true,
       .EXT_image_drm_format_modifier = device->rad_info.gfx_level >= GFX9,
       .EXT_image_robustness = true,
       .EXT_image_sliced_view_of_3d = device->rad_info.gfx_level >= GFX10,
@@ -644,7 +669,7 @@ radv_physical_device_get_features(const struct radv_physical_device *pdevice, st
       .sparseBinding = true,
       .sparseResidencyBuffer = pdevice->rad_info.family >= CHIP_POLARIS10,
       .sparseResidencyImage2D = pdevice->rad_info.family >= CHIP_POLARIS10,
-      .sparseResidencyImage3D = pdevice->rad_info.gfx_level >= GFX9,
+      .sparseResidencyImage3D = pdevice->rad_info.family >= CHIP_POLARIS10,
       .sparseResidencyAliased = pdevice->rad_info.family >= CHIP_POLARIS10,
       .variableMultisampleRate = true,
       .shaderResourceMinLod = true,
@@ -737,7 +762,7 @@ radv_physical_device_get_features(const struct radv_physical_device *pdevice, st
       .conditionalRendering = true,
       .inheritedConditionalRendering = false,
 
-      /* VK_EXT_vertex_attribute_divisor */
+      /* VK_KHR_vertex_attribute_divisor */
       .vertexAttributeInstanceRateDivisor = true,
       .vertexAttributeInstanceRateZeroDivisor = true,
 
@@ -779,10 +804,7 @@ radv_physical_device_get_features(const struct radv_physical_device *pdevice, st
       .bresenhamLines = true,
       .smoothLines = true,
       .stippledRectangularLines = false,
-      /* FIXME: Some stippled Bresenham CTS fails on Vega10
-       * but work on Raven.
-       */
-      .stippledBresenhamLines = pdevice->rad_info.gfx_level != GFX9,
+      .stippledBresenhamLines = true,
       .stippledSmoothLines = false,
 
       /* VK_EXT_robustness2 */
@@ -963,7 +985,7 @@ radv_physical_device_get_features(const struct radv_physical_device *pdevice, st
       .extendedDynamicState3TessellationDomainOrigin = true,
       .extendedDynamicState3PolygonMode = true,
       .extendedDynamicState3SampleMask = true,
-      .extendedDynamicState3AlphaToCoverageEnable = pdevice->rad_info.gfx_level < GFX11 && !pdevice->use_llvm,
+      .extendedDynamicState3AlphaToCoverageEnable = !pdevice->use_llvm,
       .extendedDynamicState3LogicOpEnable = true,
       .extendedDynamicState3LineStippleEnable = true,
       .extendedDynamicState3ColorBlendEnable = !pdevice->use_llvm,
@@ -1043,6 +1065,16 @@ radv_physical_device_get_features(const struct radv_physical_device *pdevice, st
       /* VK_KHR_cooperative_matrix */
       .cooperativeMatrix = pdevice->rad_info.gfx_level >= GFX11 && !pdevice->use_llvm,
       .cooperativeMatrixRobustBufferAccess = pdevice->rad_info.gfx_level >= GFX11 && !pdevice->use_llvm,
+
+      /* VK_EXT_image_compression_control */
+      .imageCompressionControl = true,
+
+      /* VK_EXT_device_fault */
+      .deviceFault = true,
+      .deviceFaultVendorBinary = false,
+
+      /* VK_EXT_depth_clamp_zero_one */
+      .depthClampZeroOne = true,
    };
 }
 
@@ -1452,7 +1484,7 @@ radv_get_physical_device_properties(struct radv_physical_device *pdevice)
    p->shaderArraysPerEngineCount = pdevice->rad_info.max_sa_per_se;
    p->computeUnitsPerShaderArray = pdevice->rad_info.min_good_cu_per_sa;
    p->simdPerComputeUnit = pdevice->rad_info.num_simd_per_compute_unit;
-   p->wavefrontsPerSimd = pdevice->rad_info.max_wave64_per_simd;
+   p->wavefrontsPerSimd = pdevice->rad_info.max_waves_per_simd;
    p->wavefrontSize = 64;
 
    /* SGPR. */
@@ -1471,8 +1503,9 @@ radv_get_physical_device_properties(struct radv_physical_device *pdevice)
    p->shaderCoreFeatures = 0;
    p->activeComputeUnitCount = pdevice->rad_info.num_cu;
 
-   /* VK_EXT_vertex_attribute_divisor */
+   /* VK_KHR_vertex_attribute_divisor */
    p->maxVertexAttribDivisor = UINT32_MAX;
+   p->supportsNonZeroFirstInstance = true;
 
    /* VK_EXT_conservative_rasterization */
    p->primitiveOverestimationSize = 0;
@@ -1878,10 +1911,11 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
       (device->rad_info.gfx_level == GFX10_3 || (device->instance->perftest_flags & RADV_PERFTEST_NGGC)) &&
       !(device->instance->debug_flags & RADV_DEBUG_NO_NGGC);
 
-   device->use_ngg_streamout = device->use_ngg && (device->rad_info.gfx_level >= GFX11 ||
-                                                   (device->instance->perftest_flags & RADV_PERFTEST_NGG_STREAMOUT));
+   device->use_ngg_streamout = device->rad_info.gfx_level >= GFX11;
 
    device->emulate_ngg_gs_query_pipeline_stat = device->use_ngg && device->rad_info.gfx_level < GFX11;
+
+   device->emulate_mesh_shader_queries = device->rad_info.gfx_level == GFX10_3;
 
    /* Determine the number of threads per wave for all stages. */
    device->cs_wave_size = 64;
@@ -2043,7 +2077,7 @@ static void
 radv_get_physical_device_queue_family_properties(struct radv_physical_device *pdevice, uint32_t *pCount,
                                                  VkQueueFamilyProperties **pQueueFamilyProperties)
 {
-   int num_queue_families = 1;
+   int num_queue_families = 2;
    int idx;
    if (pdevice->rad_info.ip[AMD_IP_COMPUTE].num_queues > 0 &&
        !(pdevice->instance->debug_flags & RADV_DEBUG_NO_COMPUTE_QUEUE))
@@ -2064,9 +2098,11 @@ radv_get_physical_device_queue_family_properties(struct radv_physical_device *pd
 
    idx = 0;
    if (*pCount >= 1) {
+      VkQueueFlags gfx_flags = VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
+      if (pdevice->instance->legacy_sparse_binding)
+         gfx_flags |= VK_QUEUE_SPARSE_BINDING_BIT;
       *pQueueFamilyProperties[idx] = (VkQueueFamilyProperties){
-         .queueFlags =
-            VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT | VK_QUEUE_SPARSE_BINDING_BIT,
+         .queueFlags = gfx_flags,
          .queueCount = 1,
          .timestampValidBits = 64,
          .minImageTransferGranularity = (VkExtent3D){1, 1, 1},
@@ -2076,9 +2112,12 @@ radv_get_physical_device_queue_family_properties(struct radv_physical_device *pd
 
    if (pdevice->rad_info.ip[AMD_IP_COMPUTE].num_queues > 0 &&
        !(pdevice->instance->debug_flags & RADV_DEBUG_NO_COMPUTE_QUEUE)) {
+      VkQueueFlags compute_flags = VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
+      if (pdevice->instance->legacy_sparse_binding)
+         compute_flags |= VK_QUEUE_SPARSE_BINDING_BIT;
       if (*pCount > idx) {
          *pQueueFamilyProperties[idx] = (VkQueueFamilyProperties){
-            .queueFlags = VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT | VK_QUEUE_SPARSE_BINDING_BIT,
+            .queueFlags = compute_flags,
             .queueCount = pdevice->rad_info.ip[AMD_IP_COMPUTE].num_queues,
             .timestampValidBits = 64,
             .minImageTransferGranularity = (VkExtent3D){1, 1, 1},
@@ -2099,6 +2138,16 @@ radv_get_physical_device_queue_family_properties(struct radv_physical_device *pd
             idx++;
          }
       }
+   }
+
+   if (*pCount > idx) {
+      *pQueueFamilyProperties[idx] = (VkQueueFamilyProperties){
+         .queueFlags = VK_QUEUE_SPARSE_BINDING_BIT,
+         .queueCount = 1,
+         .timestampValidBits = 64,
+         .minImageTransferGranularity = (VkExtent3D){1, 1, 1},
+      };
+      idx++;
    }
 
    *pCount = idx;
@@ -2124,9 +2173,10 @@ radv_GetPhysicalDeviceQueueFamilyProperties2(VkPhysicalDevice physicalDevice, ui
       &pQueueFamilyProperties[0].queueFamilyProperties,
       &pQueueFamilyProperties[1].queueFamilyProperties,
       &pQueueFamilyProperties[2].queueFamilyProperties,
+      &pQueueFamilyProperties[3].queueFamilyProperties,
    };
    radv_get_physical_device_queue_family_properties(pdevice, pCount, properties);
-   assert(*pCount <= 3);
+   assert(*pCount <= 4);
 
    for (uint32_t i = 0; i < *pCount; i++) {
       vk_foreach_struct (ext, pQueueFamilyProperties[i].pNext) {
@@ -2300,23 +2350,23 @@ radv_GetPhysicalDeviceMemoryProperties2(VkPhysicalDevice physicalDevice,
       radv_get_memory_budget_properties(physicalDevice, memory_budget);
 }
 
-static const VkTimeDomainEXT radv_time_domains[] = {
-   VK_TIME_DOMAIN_DEVICE_EXT,
-   VK_TIME_DOMAIN_CLOCK_MONOTONIC_EXT,
+static const VkTimeDomainKHR radv_time_domains[] = {
+   VK_TIME_DOMAIN_DEVICE_KHR,
+   VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR,
 #ifdef CLOCK_MONOTONIC_RAW
-   VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_EXT,
+   VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR,
 #endif
 };
 
 VKAPI_ATTR VkResult VKAPI_CALL
-radv_GetPhysicalDeviceCalibrateableTimeDomainsEXT(VkPhysicalDevice physicalDevice, uint32_t *pTimeDomainCount,
-                                                  VkTimeDomainEXT *pTimeDomains)
+radv_GetPhysicalDeviceCalibrateableTimeDomainsKHR(VkPhysicalDevice physicalDevice, uint32_t *pTimeDomainCount,
+                                                  VkTimeDomainKHR *pTimeDomains)
 {
    int d;
-   VK_OUTARRAY_MAKE_TYPED(VkTimeDomainEXT, out, pTimeDomains, pTimeDomainCount);
+   VK_OUTARRAY_MAKE_TYPED(VkTimeDomainKHR, out, pTimeDomains, pTimeDomainCount);
 
    for (d = 0; d < ARRAY_SIZE(radv_time_domains); d++) {
-      vk_outarray_append_typed(VkTimeDomainEXT, &out, i)
+      vk_outarray_append_typed(VkTimeDomainKHR, &out, i)
       {
          *i = radv_time_domains[d];
       }

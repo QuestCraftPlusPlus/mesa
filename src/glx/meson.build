@@ -73,13 +73,6 @@ files_libglx = files(
   'xfont.c',
 )
 
-if with_glx_fake
-  files_libglx = files(
-    'fakeglx.c',
-  )
-  glx_generated = []
-endif
-
 extra_libs_libglx = []
 extra_deps_libgl = []
 extra_ld_args_libgl = []
@@ -135,7 +128,6 @@ libglx = static_library(
   include_directories : [inc_include, inc_src, inc_glapi, inc_loader],
   c_args : [
     '-DGL_LIB_NAME="lib@0@.so.@1@"'.format(gl_lib_name, gl_lib_version.split('.')[0]),
-	'-DGLX_DIRECT_RENDERING',
   ],
   gnu_symbol_visibility : 'hidden',
   link_with : [
@@ -144,7 +136,7 @@ libglx = static_library(
   ],
   dependencies : [
     idep_mesautil, idep_xmlconfig,
-    dep_libdrm, dep_dri2proto, dep_glproto, dep_x11, dep_glvnd, dep_xxf86vm, dep_xshmfence
+    dep_libdrm, dep_dri2proto, dep_glproto, dep_x11, dep_xext, dep_glvnd, dep_xxf86vm, dep_xshmfence
   ],
 )
 

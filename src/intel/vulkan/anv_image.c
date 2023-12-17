@@ -830,7 +830,8 @@ add_aux_surface_if_supported(struct anv_device *device,
          if (intel_needs_workaround(device->info, 1607794140)) {
             /* FCV is permanently enabled on this HW. */
             image->planes[plane].aux_usage = ISL_AUX_USAGE_FCV_CCS_E;
-         } else if (intel_device_info_is_dg2(device->info)) {
+         } else if (device->info->verx10 >= 125 &&
+                    !device->physical->disable_fcv) {
             /* FCV is enabled via 3DSTATE_3D_MODE. We'd expect plain CCS_E to
              * perform better because it allows for non-zero fast clear colors,
              * but we've run into regressions in several benchmarks (F1 22 and
@@ -1703,6 +1704,25 @@ anv_image_finish(struct anv_image *image)
    if (anv_image_is_sparse(image))
       anv_image_finish_sparse_bindings(image);
 
+   /* Unmap a CCS so that if the bound region of the image is rebound to
+    * another image, the AUX tables will be cleared to allow for a new
+    * mapping.
+    */
+   for (int p = 0; p < image->n_planes; ++p) {
+      if (!image->planes[p].aux_ccs_mapped)
+         continue;
+
+      const struct anv_address main_addr =
+         anv_image_address(image,
+                           &image->planes[p].primary_surface.memory_range);
+      const struct isl_surf *surf =
+         &image->planes[p].primary_surface.isl;
+
+      intel_aux_map_del_mapping(device->aux_map_ctx,
+                                anv_address_physical(main_addr),
+                                surf->size_B);
+   }
+
    if (image->from_gralloc) {
       assert(!image->disjoint);
       assert(image->n_planes == 1);
@@ -1890,41 +1910,35 @@ anv_image_get_memory_requirements(struct anv_device *device,
     *    supported memory type for the resource. The bit `1<<i` is set if and
     *    only if the memory type `i` in the VkPhysicalDeviceMemoryProperties
     *    structure for the physical device is supported.
-    *
-    * All types are currently supported for images.
     */
-   uint32_t memory_types = (1ull << device->physical->memory.type_count) - 1;
+   uint32_t memory_types = 0;
+   for (uint32_t i = 0; i < device->physical->memory.type_count; i++) {
+      /* Have the protected image bit match only the memory types with the
+       * equivalent bit.
+       */
+      if (!!(image->vk.create_flags & VK_IMAGE_CREATE_PROTECTED_BIT) !=
+          !!(device->physical->memory.types[i].propertyFlags &
+             VK_MEMORY_PROPERTY_PROTECTED_BIT))
+         continue;
+
+      memory_types |= 1ull << i;
+   }
 
    vk_foreach_struct(ext, pMemoryRequirements->pNext) {
       switch (ext->sType) {
       case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_REQUIREMENTS: {
          VkMemoryDedicatedRequirements *requirements = (void *)ext;
-         if (image->vk.wsi_legacy_scanout || image->from_ahb) {
-            /* If we need to set the tiling for external consumers, we need a
-             * dedicated allocation.
+         if (image->vk.wsi_legacy_scanout ||
+             image->from_ahb ||
+             (isl_drm_modifier_has_aux(image->vk.drm_format_mod) &&
+              anv_image_uses_aux_map(device, image))) {
+            /* If we need to set the tiling for external consumers or the
+             * modifier involves AUX tables, we need a dedicated allocation.
              *
              * See also anv_AllocateMemory.
              */
             requirements->prefersDedicatedAllocation = true;
             requirements->requiresDedicatedAllocation = true;
-         } else if (anv_image_uses_aux_map(device, image)) {
-            /* We request a dedicated allocation to guarantee that the BO will
-             * be aux-map compatible (see anv_bo_vma_alloc_or_close and
-             * anv_bo_allows_aux_map).
-             *
-             * TODO: This is an untested heuristic. It's not known if this
-             *       guarantee is worth losing suballocation.
-             *
-             * If we don't have an aux-map compatible BO at the time we bind
-             * this image to device memory, we'll change the aux usage.
-             *
-             * It may be possible to handle an image using a modifier in the
-             * same way. However, we choose to keep things simple and require
-             * a dedicated allocation for that case.
-             */
-            requirements->prefersDedicatedAllocation = true;
-            requirements->requiresDedicatedAllocation =
-               isl_drm_modifier_has_aux(image->vk.drm_format_mod);
          } else {
             requirements->prefersDedicatedAllocation = false;
             requirements->requiresDedicatedAllocation = false;
@@ -1995,7 +2009,7 @@ void anv_GetImageMemoryRequirements2(
                                      pMemoryRequirements);
 }
 
-void anv_GetDeviceImageMemoryRequirementsKHR(
+void anv_GetDeviceImageMemoryRequirements(
     VkDevice                                    _device,
     const VkDeviceImageMemoryRequirements*   pInfo,
     VkMemoryRequirements2*                      pMemoryRequirements)
@@ -2142,7 +2156,7 @@ void anv_GetDeviceImageSparseMemoryRequirements(
       return;
    }
 
-   /* This function is similar to anv_GetDeviceImageMemoryRequirementsKHR, in
+   /* This function is similar to anv_GetDeviceImageMemoryRequirements, in
     * which it actually creates an image, gets the properties and then
     * destroys the image.
     *
@@ -2301,10 +2315,9 @@ VkResult anv_BindImageMemory2(
             continue;
 
          /* Add the plane to the aux map when applicable. */
-         if (anv_bo_allows_aux_map(device, bo)) {
-            const struct anv_address main_addr =
-               anv_image_address(image,
-                 &image->planes[p].primary_surface.memory_range);
+         const struct anv_address main_addr = anv_image_address(
+            image, &image->planes[p].primary_surface.memory_range);
+         if (anv_address_allows_aux_map(device, main_addr)) {
             const struct anv_address aux_addr =
                anv_image_address(image,
                  &image->planes[p].compr_ctrl_memory_range);
@@ -2312,12 +2325,12 @@ VkResult anv_BindImageMemory2(
                &image->planes[p].primary_surface.isl;
             const uint64_t format_bits =
                intel_aux_map_format_bits_for_isl_surf(surf);
-            const bool mapped =
+            image->planes[p].aux_ccs_mapped =
                intel_aux_map_add_mapping(device->aux_map_ctx,
                                          anv_address_physical(main_addr),
                                          anv_address_physical(aux_addr),
                                          surf->size_B, format_bits);
-            if (mapped)
+            if (image->planes[p].aux_ccs_mapped)
                continue;
          }
 
@@ -3254,6 +3267,16 @@ anv_can_fast_clear_color_view(struct anv_device *device,
       anv_perf_warn(VK_LOG_OBJS(&iview->image->vk.base),
                     "Rendering to a multi-layer framebuffer with "
                     "LOAD_OP_CLEAR.  Only fast-clearing the first slice");
+   }
+
+   /* Wa_18020603990 - slow clear surfaces up to 256x256, 32bpp. */
+   if (intel_needs_workaround(device->info, 18020603990)) {
+      const struct anv_surface *anv_surf =
+         &iview->image->planes->primary_surface;
+      if (isl_format_get_layout(anv_surf->isl.format)->bpb <= 32 &&
+          anv_surf->isl.logical_level0_px.w <= 256 &&
+          anv_surf->isl.logical_level0_px.h <= 256)
+         return false;
    }
 
    return true;

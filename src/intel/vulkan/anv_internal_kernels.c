@@ -243,7 +243,9 @@ compile_upload_spirv(struct anv_device *device,
    memset(&prog_data, 0, sizeof(prog_data));
    prog_data.base.nr_params = nir->num_uniforms / 4;
 
-   brw_nir_analyze_ubo_ranges(compiler, nir, NULL, prog_data.base.ubo_ranges);
+   brw_nir_analyze_ubo_ranges(compiler, nir, prog_data.base.ubo_ranges);
+
+   void *temp_ctx = ralloc_context(NULL);
 
    const unsigned *program;
    if (stage == MESA_SHADER_FRAGMENT) {
@@ -254,6 +256,7 @@ compile_upload_spirv(struct anv_device *device,
             .log_data = device,
             .debug_flag = DEBUG_WM,
             .stats = stats,
+            .mem_ctx = temp_ctx,
          },
          .key = &key.wm,
          .prog_data = &prog_data.wm,
@@ -287,6 +290,7 @@ compile_upload_spirv(struct anv_device *device,
             .stats = &stats,
             .log_data = device,
             .debug_flag = DEBUG_CS,
+            .mem_ctx = temp_ctx,
          },
          .key = &key.cs,
          .prog_data = &prog_data.cs,
@@ -314,6 +318,7 @@ compile_upload_spirv(struct anv_device *device,
                                &push_desc_info,
                                0 /* dynamic_push_values */);
 
+   ralloc_free(temp_ctx);
    ralloc_free(nir);
 
    return kernel;

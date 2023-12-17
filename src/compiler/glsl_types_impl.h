@@ -8,10 +8,6 @@
 
 #ifdef __cplusplus
 
-#define BUILTIN_TYPES_CPP_DEFINITIONS
-#include "compiler/builtin_types_cpp.h"
-#undef BUILTIN_TYPES_CPP_DEFINITIONS
-
 inline bool glsl_type::is_boolean() const { return glsl_type_is_boolean(this); }
 inline bool glsl_type::is_sampler() const { return glsl_type_is_sampler(this); }
 inline bool glsl_type::is_texture() const { return glsl_type_is_texture(this); }
@@ -277,12 +273,6 @@ glsl_type::is_uint_16_32() const
 {
    return base_type == GLSL_TYPE_UINT ||
           base_type == GLSL_TYPE_UINT16;
-}
-
-inline bool
-glsl_type::is_anonymous() const
-{
-   return !strncmp(glsl_get_type_name(this), "#anon", 5);
 }
 
 inline unsigned glsl_type::arrays_of_arrays_size() const { return glsl_get_aoa_size(this); }

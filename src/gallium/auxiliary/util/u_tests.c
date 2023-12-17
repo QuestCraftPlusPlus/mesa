@@ -520,8 +520,12 @@ disabled_fragment_shader(struct pipe_context *ctx)
    util_report_result(qresult.u64 == 2);
 }
 
+#if DETECT_OS_LINUX && defined(HAVE_LIBDRM)
+#include <libsync.h>
+#else
 #define sync_merge(str, fd1, fd2) (-1)
 #define sync_wait(fd, timeout) (-1)
+#endif
 
 static void
 test_sync_file_fences(struct pipe_context *ctx)

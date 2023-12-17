@@ -58,7 +58,7 @@ void encode_type_to_blob(struct blob *blob, const struct glsl_type *type);
 const struct glsl_type *decode_type_from_blob(struct blob_reader *blob);
 
 typedef void (*glsl_type_size_align_func)(const struct glsl_type *type,
-                                          unsigned *size, unsigned *align);
+                                          unsigned *size, unsigned *alignment);
 
 enum glsl_base_type {
    /* Note: GLSL_TYPE_UINT, GLSL_TYPE_INT, and GLSL_TYPE_FLOAT must be 0, 1,
@@ -379,15 +379,6 @@ struct glsl_type {
 /* C++ parts of glsl_type. */
 #ifdef __cplusplus
    /**
-    * \name Pointers to various public type singletons
-    */
-   /*@{*/
-#define BUILTIN_TYPES_CPP_DECLARATIONS
-#include "builtin_types_cpp.h"
-#undef BUILTIN_TYPES_CPP_DECLARATIONS
-   /*@}*/
-
-   /**
     * Convenience accessors for vector types (shorter than get_instance()).
     * @{
     */
@@ -483,7 +474,7 @@ struct glsl_type {
    const glsl_type *get_explicit_std430_type(bool row_major) const;
    const glsl_type *get_explicit_interface_type(bool supports_std430) const;
    const glsl_type *get_explicit_type_for_size_align(glsl_type_size_align_func type_info,
-                                                     unsigned *size, unsigned *align) const;
+                                                     unsigned *size, unsigned *alignment) const;
    const glsl_type *without_array() const;
    const glsl_type *row_type() const;
    const glsl_type *column_type() const;
@@ -545,11 +536,6 @@ struct glsl_type {
    enum glsl_interface_packing get_interface_packing() const;
    enum glsl_interface_packing get_internal_ifc_packing(bool std430_supported) const;
    bool get_interface_row_major() const;
-
-   /**
-    * Query if a type is unnamed/anonymous (named by the parser)
-    */
-   bool is_anonymous() const;
 
    /**
     * Get the type of a structure field
@@ -1020,9 +1006,16 @@ static inline const struct glsl_type *glsl_void_type(void) { return &glsl_type_b
 static inline const struct glsl_type *glsl_float_type(void) { return &glsl_type_builtin_float; }
 static inline const struct glsl_type *glsl_float16_t_type(void) { return &glsl_type_builtin_float16_t; }
 static inline const struct glsl_type *glsl_double_type(void) { return &glsl_type_builtin_double; }
+static inline const struct glsl_type *glsl_vec2_type(void) { return &glsl_type_builtin_vec2; }
+static inline const struct glsl_type *glsl_dvec2_type(void) { return &glsl_type_builtin_ivec2; }
+static inline const struct glsl_type *glsl_uvec2_type(void) { return &glsl_type_builtin_uvec2; }
+static inline const struct glsl_type *glsl_ivec2_type(void) { return &glsl_type_builtin_ivec2; }
+static inline const struct glsl_type *glsl_bvec2_type(void) { return &glsl_type_builtin_bvec2; }
 static inline const struct glsl_type *glsl_vec4_type(void) { return &glsl_type_builtin_vec4; }
+static inline const struct glsl_type *glsl_dvec4_type(void) { return &glsl_type_builtin_ivec4; }
 static inline const struct glsl_type *glsl_uvec4_type(void) { return &glsl_type_builtin_uvec4; }
 static inline const struct glsl_type *glsl_ivec4_type(void) { return &glsl_type_builtin_ivec4; }
+static inline const struct glsl_type *glsl_bvec4_type(void) { return &glsl_type_builtin_bvec4; }
 static inline const struct glsl_type *glsl_int_type(void) { return &glsl_type_builtin_int; }
 static inline const struct glsl_type *glsl_uint_type(void) { return &glsl_type_builtin_uint; }
 static inline const struct glsl_type *glsl_int64_t_type(void) { return &glsl_type_builtin_int64_t; }

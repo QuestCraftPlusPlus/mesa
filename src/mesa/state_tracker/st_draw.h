@@ -73,6 +73,8 @@ pointer_to_offset(const void *ptr)
    return (unsigned) (((GLsizeiptr) ptr) & 0xffffffffUL);
 }
 
+void
+st_prepare_draw(struct gl_context *ctx, uint64_t state_mask);
 
 bool
 st_draw_quad(struct st_context *st,
@@ -80,11 +82,6 @@ st_draw_quad(struct st_context *st,
              float s0, float t0, float s1, float t1,
              const float *color,
              unsigned num_instances);
-
-void
-st_draw_transform_feedback(struct gl_context *ctx, GLenum mode,
-                           unsigned num_instances, unsigned stream,
-                           struct gl_transform_feedback_object *tfb_vertcount);
 
 void
 st_indirect_draw_vbo(struct gl_context *ctx,

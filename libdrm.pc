@@ -1,4 +1,0 @@
-Name: libdrm
-Description: libdrm library
-Version: 2.4.117
-Libs: -L/home/cole/mesa -ldrm

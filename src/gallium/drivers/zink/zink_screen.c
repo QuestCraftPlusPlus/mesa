@@ -265,6 +265,15 @@ disk_cache_init(struct zink_screen *screen)
    struct mesa_sha1 ctx;
    _mesa_sha1_init(&ctx);
 
+#ifdef HAVE_DL_ITERATE_PHDR
+   /* Hash in the zink driver build. */
+   const struct build_id_note *note =
+       build_id_find_nhdr_for_addr(disk_cache_init);
+   unsigned build_id_len = build_id_length(note);
+   assert(note && build_id_len == 20); /* sha1 */
+   _mesa_sha1_update(&ctx, build_id_data(note), build_id_len);
+#endif
+
    /* Hash in the Vulkan pipeline cache UUID to identify the combination of
    *  vulkan device and driver (or any inserted layer that would invalidate our
    *  cached pipelines).
@@ -1511,10 +1520,14 @@ zink_destroy_screen(struct pipe_screen *pscreen)
    if (screen->dev)
       VKSCR(DestroyDevice)(screen->dev, NULL);
 
-   VKSCR(DestroyInstance)(screen->instance, NULL);
+   if (screen->instance)
+      VKSCR(DestroyInstance)(screen->instance, NULL);
+
    util_idalloc_mt_fini(&screen->buffer_ids);
 
-   util_dl_close(screen->loader_lib);
+   if (screen->loader_lib)
+      util_dl_close(screen->loader_lib);
+
    if (screen->drm_fd != -1)
       close(screen->drm_fd);
 
@@ -1618,6 +1631,12 @@ choose_pdev(struct zink_screen *screen, int64_t dev_major, int64_t dev_minor)
       screen->pdev = pdev;
    }
    VKSCR(GetPhysicalDeviceProperties)(screen->pdev, &screen->info.props);
+
+   /* allow software rendering only if forced by the user */
+   if (!cpu && screen->info.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) {
+      screen->pdev = VK_NULL_HANDLE;
+      return;
+   }
 
    screen->info.device_version = screen->info.props.apiVersion;
 
@@ -2866,6 +2885,7 @@ init_driver_workarounds(struct zink_screen *screen)
    /* these drivers can successfully do INVALID <-> LINEAR dri3 modifier swap */
    switch (screen->info.driver_props.driverID) {
    case VK_DRIVER_ID_MESA_TURNIP:
+   case VK_DRIVER_ID_MESA_VENUS:
       screen->driver_workarounds.can_do_invalid_linear_modifier = true;
       break;
    default:
@@ -3106,6 +3126,8 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
       return NULL;
    }
 
+   screen->drm_fd = -1;
+
    glsl_type_singleton_init_or_ref();
    zink_debug = debug_get_option_zink_debug();
    if (zink_descriptor_mode == ZINK_DESCRIPTOR_MODE_AUTO)
@@ -3121,7 +3143,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
 
    u_trace_state_init();
 
-   screen->loader_lib = (void*) strtoul(getenv("VULKAN_PTR"), NULL, 0x10);
+   screen->loader_lib = util_dl_open(VK_LIBNAME);
    if (!screen->loader_lib) {
       mesa_loge("ZINK: failed to load "VK_LIBNAME);
       goto fail;
@@ -3136,6 +3158,15 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
    }
 
    screen->instance_info.loader_version = zink_get_loader_version(screen);
+   if (config) {
+      driParseConfigFiles(config->options, config->options_info, 0, "zink",
+                          NULL, NULL, NULL, 0, NULL, 0);
+      screen->driconf.dual_color_blend_by_location = driQueryOptionb(config->options, "dual_color_blend_by_location");
+      screen->driconf.glsl_correct_derivatives_after_discard = driQueryOptionb(config->options, "glsl_correct_derivatives_after_discard");
+      //screen->driconf.inline_uniforms = driQueryOptionb(config->options, "radeonsi_inline_uniforms");
+      screen->driconf.emulate_point_smooth = driQueryOptionb(config->options, "zink_emulate_point_smooth");
+      screen->driconf.zink_shader_object_enable = driQueryOptionb(config->options, "zink_shader_object_enable");
+   }
 
    if (!zink_create_instance(screen, dev_major > 0 && dev_major < 255))
       goto fail;

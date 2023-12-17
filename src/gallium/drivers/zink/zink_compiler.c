@@ -484,21 +484,6 @@ lower_pv_mode_gs_instr(nir_builder *b, nir_instr *instr, void *data)
    }
 }
 
-static unsigned int
-lower_pv_mode_vertices_for_prim(enum mesa_prim prim)
-{
-   switch (prim) {
-   case MESA_PRIM_POINTS:
-      return 1;
-   case MESA_PRIM_LINE_STRIP:
-      return 2;
-   case MESA_PRIM_TRIANGLE_STRIP:
-      return 3;
-   default:
-      unreachable("unsupported primitive for gs output");
-   }
-}
-
 static bool
 lower_pv_mode_gs(nir_shader *shader, unsigned prim)
 {
@@ -510,7 +495,7 @@ lower_pv_mode_gs(nir_shader *shader, unsigned prim)
    b = nir_builder_at(nir_before_impl(entry));
 
    state.primitive_vert_count =
-      lower_pv_mode_vertices_for_prim(shader->info.gs.output_primitive);
+      mesa_vertices_per_prim(shader->info.gs.output_primitive);
    state.ring_size = shader->info.gs.vertices_out;
 
    nir_foreach_variable_with_modes(var, shader, nir_var_shader_out) {
@@ -1212,6 +1197,7 @@ zink_screen_init_compiler(struct zink_screen *screen)
       .lower_fsat = true,
       .lower_hadd = true,
       .lower_iadd_sat = true,
+      .lower_fisnormal = true,
       .lower_extract_byte = true,
       .lower_extract_word = true,
       .lower_insert_byte = true,
@@ -2775,6 +2761,11 @@ zink_compiler_assign_io(struct zink_screen *screen, nir_shader *producer, nir_sh
          NIR_PASS_V(producer, nir_remove_dead_variables, nir_var_shader_temp, NULL);
          optimize_nir(producer, NULL, true);
       }
+   }
+   if (consumer->info.stage != MESA_SHADER_FRAGMENT) {
+      producer->info.has_transform_feedback_varyings = false;
+      nir_foreach_shader_out_variable(var, producer)
+         var->data.explicit_xfb_buffer = false;
    }
    if (producer->info.stage == MESA_SHADER_TESS_CTRL) {
       /* never assign from tcs -> tes, always invert */
@@ -5306,6 +5297,55 @@ mem_access_size_align_cb(nir_intrinsic_op intrin, uint8_t bytes,
    };
 }
 
+static nir_mem_access_size_align
+mem_access_scratch_size_align_cb(nir_intrinsic_op intrin, uint8_t bytes,
+                                 uint8_t bit_size, uint32_t align,
+                                 uint32_t align_offset, bool offset_is_const,
+                                 const void *cb_data)
+{
+   bit_size = *(const uint8_t *)cb_data;
+   align = nir_combined_align(align, align_offset);
+
+   assert(util_is_power_of_two_nonzero(align));
+
+   return (nir_mem_access_size_align){
+      .num_components = MIN2(bytes / (bit_size / 8), 4),
+      .bit_size = bit_size,
+      .align = bit_size / 8,
+   };
+}
+
+static bool
+alias_scratch_memory_scan_bit_size(struct nir_builder *b, nir_intrinsic_instr *instr, void *data)
+{
+   uint8_t *bit_size = data;
+   switch (instr->intrinsic) {
+   case nir_intrinsic_load_scratch:
+      *bit_size = MIN2(*bit_size, instr->def.bit_size);
+      return false;
+   case nir_intrinsic_store_scratch:
+      *bit_size = MIN2(*bit_size, instr->src[0].ssa->bit_size);
+      return false;
+   default:
+      return false;
+   }
+}
+
+static bool
+alias_scratch_memory(nir_shader *nir)
+{
+   uint8_t bit_size = 64;
+
+   nir_shader_intrinsics_pass(nir, alias_scratch_memory_scan_bit_size, nir_metadata_all, &bit_size);
+   nir_lower_mem_access_bit_sizes_options lower_scratch_mem_access_options = {
+      .modes = nir_var_function_temp,
+      .may_lower_unaligned_stores_to_atomics = true,
+      .callback = mem_access_scratch_size_align_cb,
+      .cb_data = &bit_size,
+   };
+   return nir_lower_mem_access_bit_sizes(nir, &lower_scratch_mem_access_options);
+}
+
 static uint8_t
 lower_vec816_alu(const nir_instr *instr, const void *cb_data)
 {
@@ -5323,6 +5363,28 @@ zink_shader_create(struct zink_screen *screen, struct nir_shader *nir)
 
    ret->sinfo.have_vulkan_memory_model = screen->info.have_KHR_vulkan_memory_model;
    ret->sinfo.have_workgroup_memory_explicit_layout = screen->info.have_KHR_workgroup_memory_explicit_layout;
+   if (screen->info.have_KHR_shader_float_controls) {
+      if (screen->info.props12.shaderDenormFlushToZeroFloat16)
+         ret->sinfo.float_controls.flush_denorms |= 0x1;
+      if (screen->info.props12.shaderDenormFlushToZeroFloat32)
+         ret->sinfo.float_controls.flush_denorms |= 0x2;
+      if (screen->info.props12.shaderDenormFlushToZeroFloat64)
+         ret->sinfo.float_controls.flush_denorms |= 0x4;
+
+      if (screen->info.props12.shaderDenormPreserveFloat16)
+         ret->sinfo.float_controls.preserve_denorms |= 0x1;
+      if (screen->info.props12.shaderDenormPreserveFloat32)
+         ret->sinfo.float_controls.preserve_denorms |= 0x2;
+      if (screen->info.props12.shaderDenormPreserveFloat64)
+         ret->sinfo.float_controls.preserve_denorms |= 0x4;
+
+      ret->sinfo.float_controls.denorms_all_independence =
+         screen->info.props12.denormBehaviorIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL;
+
+      ret->sinfo.float_controls.denorms_32_bit_independence =
+         ret->sinfo.float_controls.denorms_all_independence ||
+         screen->info.props12.denormBehaviorIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_32_BIT_ONLY;
+   }
    ret->sinfo.bindless_set_idx = screen->desc_set_id[ZINK_DESCRIPTOR_BINDLESS];
 
    util_queue_fence_init(&ret->precompile.fence);
@@ -5353,12 +5415,13 @@ zink_shader_create(struct zink_screen *screen, struct nir_shader *nir)
 
    if (nir->info.stage == MESA_SHADER_KERNEL) {
       nir_lower_mem_access_bit_sizes_options lower_mem_access_options = {
-         .modes = nir_var_all,
+         .modes = nir_var_all ^ nir_var_function_temp,
          .may_lower_unaligned_stores_to_atomics = true,
          .callback = mem_access_size_align_cb,
          .cb_data = screen,
       };
       NIR_PASS_V(nir, nir_lower_mem_access_bit_sizes, &lower_mem_access_options);
+      NIR_PASS_V(nir, alias_scratch_memory);
       NIR_PASS_V(nir, nir_lower_alu_width, lower_vec816_alu, NULL);
       NIR_PASS_V(nir, nir_lower_alu_vec8_16_srcs);
    }

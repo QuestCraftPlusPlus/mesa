@@ -1146,6 +1146,7 @@ get_back_bo(struct dri2_egl_surface *dri2_surf)
             int buffer_fds[4];
             int strides[4];
             int offsets[4];
+            unsigned error;
 
             if (!dri2_dpy->image->queryImage(linear_copy_display_gpu_image,
                                              __DRI_IMAGE_ATTRIB_NUM_PLANES,
@@ -1185,12 +1186,17 @@ get_back_bo(struct dri2_egl_surface *dri2_surf)
             /* The linear buffer was created in the display GPU's vram, so we
              * need to make it visible to render GPU
              */
-            dri2_surf->back->linear_copy = dri2_dpy->image->createImageFromFds(
-               dri2_dpy->dri_screen_render_gpu, dri2_surf->base.Width,
-               dri2_surf->base.Height,
-               loader_image_format_to_fourcc(linear_dri_image_format),
-               &buffer_fds[0], num_planes, &strides[0], &offsets[0],
-               dri2_surf->back);
+            dri2_surf->back->linear_copy =
+               dri2_dpy->image->createImageFromDmaBufs3(
+                  dri2_dpy->dri_screen_render_gpu, dri2_surf->base.Width,
+                  dri2_surf->base.Height,
+                  loader_image_format_to_fourcc(linear_dri_image_format),
+                  linear_mod, &buffer_fds[0], num_planes, &strides[0],
+                  &offsets[0], __DRI_YUV_COLOR_SPACE_UNDEFINED,
+                  __DRI_YUV_RANGE_UNDEFINED, __DRI_YUV_CHROMA_SITING_UNDEFINED,
+                  __DRI_YUV_CHROMA_SITING_UNDEFINED, 0, &error,
+                  dri2_surf->back);
+
             for (i = 0; i < num_planes; ++i) {
                if (buffer_fds[i] != -1)
                   close(buffer_fds[i]);
@@ -2161,7 +2167,6 @@ dri2_initialize_wayland_drm_extensions(struct dri2_egl_display *dri2_dpy)
 static EGLBoolean
 dri2_initialize_wayland_drm(_EGLDisplay *disp)
 {
-   _EGLDevice *dev;
    struct dri2_egl_display *dri2_dpy = dri2_display_create();
    if (!dri2_dpy)
       return EGL_FALSE;
@@ -2205,14 +2210,6 @@ dri2_initialize_wayland_drm(_EGLDisplay *disp)
    loader_get_user_preferred_fd(&dri2_dpy->fd_render_gpu,
                                 &dri2_dpy->fd_display_gpu);
 
-   dev = _eglFindDevice(dri2_dpy->fd_render_gpu, false);
-   if (!dev) {
-      _eglError(EGL_NOT_INITIALIZED, "DRI2: failed to find EGLDevice");
-      goto cleanup;
-   }
-
-   disp->Device = dev;
-
    if (dri2_dpy->fd_render_gpu != dri2_dpy->fd_display_gpu) {
       free(dri2_dpy->device_name);
       dri2_dpy->device_name =
@@ -2248,6 +2245,11 @@ dri2_initialize_wayland_drm(_EGLDisplay *disp)
 
    if (!dri2_setup_extensions(disp))
       goto cleanup;
+
+   if (!dri2_setup_device(disp, false)) {
+      _eglError(EGL_NOT_INITIALIZED, "DRI2: failed to setup EGLDevice");
+      goto cleanup;
+   }
 
    dri2_setup_screen(disp);
 
@@ -2730,7 +2732,6 @@ static const __DRIextension *swrast_loader_extensions[] = {
 static EGLBoolean
 dri2_initialize_wayland_swrast(_EGLDisplay *disp)
 {
-   _EGLDevice *dev;
    struct dri2_egl_display *dri2_dpy = dri2_display_create();
    if (!dri2_dpy)
       return EGL_FALSE;
@@ -2776,14 +2777,6 @@ dri2_initialize_wayland_swrast(_EGLDisplay *disp)
    if (disp->Options.Zink)
       dri2_initialize_wayland_drm_extensions(dri2_dpy);
 
-   dev = _eglFindDevice(dri2_dpy->fd_render_gpu, true);
-   if (!dev) {
-      _eglError(EGL_NOT_INITIALIZED, "DRI2: failed to find EGLDevice");
-      goto cleanup;
-   }
-
-   disp->Device = dev;
-
    dri2_dpy->driver_name = strdup(disp->Options.Zink ? "zink" : "swrast");
    if (!dri2_load_driver_swrast(disp))
       goto cleanup;
@@ -2795,6 +2788,11 @@ dri2_initialize_wayland_swrast(_EGLDisplay *disp)
 
    if (!dri2_setup_extensions(disp))
       goto cleanup;
+
+   if (!dri2_setup_device(disp, true)) {
+      _eglError(EGL_NOT_INITIALIZED, "DRI2: failed to setup EGLDevice");
+      goto cleanup;
+   }
 
    dri2_setup_screen(disp);
 

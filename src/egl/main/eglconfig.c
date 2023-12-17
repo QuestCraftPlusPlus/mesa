@@ -208,7 +208,7 @@ static const struct {
                                     EGL_DONT_CARE },
    { EGL_RENDERABLE_TYPE,           ATTRIB_TYPE_BITMASK,
                                     ATTRIB_CRITERION_MASK,
-                                    EGL_OPENGL_BIT },
+                                    EGL_OPENGL_ES_BIT },
    { EGL_SAMPLE_BUFFERS,            ATTRIB_TYPE_INTEGER,
                                     ATTRIB_CRITERION_ATLEAST,
                                     0 },

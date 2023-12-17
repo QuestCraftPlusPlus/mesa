@@ -771,7 +771,7 @@ anv_pipeline_hash_graphics(struct anv_graphics_base_pipeline *pipeline,
    }
 
    if (stages[MESA_SHADER_MESH].info || stages[MESA_SHADER_TASK].info) {
-      const bool afs = device->physical->instance->assume_full_subgroups;
+      const uint8_t afs = device->physical->instance->assume_full_subgroups;
       _mesa_sha1_update(&ctx, &afs, sizeof(afs));
    }
 
@@ -789,7 +789,7 @@ anv_pipeline_hash_compute(struct anv_compute_pipeline *pipeline,
 
    anv_pipeline_hash_common(&ctx, &pipeline->base);
 
-   const bool afs = device->physical->instance->assume_full_subgroups;
+   const uint8_t afs = device->physical->instance->assume_full_subgroups;
    _mesa_sha1_update(&ctx, &afs, sizeof(afs));
 
    _mesa_sha1_update(&ctx, stage->shader_sha1,
@@ -1811,7 +1811,7 @@ anv_graphics_pipeline_load_cached_shaders(struct anv_graphics_base_pipeline *pip
                                           struct vk_pipeline_cache *cache,
                                           struct anv_pipeline_stage *stages,
                                           bool link_optimize,
-                                          VkPipelineCreationFeedbackEXT *pipeline_feedback)
+                                          VkPipelineCreationFeedback *pipeline_feedback)
 {
    struct anv_device *device = pipeline->base.device;
    unsigned cache_hits = 0, found = 0, imported = 0;
@@ -1854,6 +1854,7 @@ anv_graphics_pipeline_load_cached_shaders(struct anv_graphics_base_pipeline *pip
             continue;
 
          pipeline->shaders[s] = anv_shader_bin_ref(stages[s].imported.bin);
+         pipeline->source_hashes[s] = stages[s].source_hash;
          imported++;
       }
    }
@@ -1991,7 +1992,9 @@ anv_fixup_subgroup_size(struct anv_device *device, struct shader_info *info)
     * a size.
     */
    if (info->subgroup_size == SUBGROUP_SIZE_FULL_SUBGROUPS)
-      info->subgroup_size = BRW_SUBGROUP_SIZE;
+      info->subgroup_size =
+         device->physical->instance->assume_full_subgroups != 0 ?
+         device->physical->instance->assume_full_subgroups : BRW_SUBGROUP_SIZE;
 }
 
 static void
@@ -2040,7 +2043,7 @@ anv_pipeline_nir_preprocess(struct anv_pipeline *pipeline,
 
 static void
 anv_fill_pipeline_creation_feedback(const struct anv_graphics_base_pipeline *pipeline,
-                                    VkPipelineCreationFeedbackEXT *pipeline_feedback,
+                                    VkPipelineCreationFeedback *pipeline_feedback,
                                     const VkGraphicsPipelineCreateInfo *info,
                                     struct anv_pipeline_stage *stages)
 {
@@ -2093,7 +2096,7 @@ static VkResult
 anv_graphics_pipeline_compile(struct anv_graphics_base_pipeline *pipeline,
                               struct anv_pipeline_stage *stages,
                               struct vk_pipeline_cache *cache,
-                              VkPipelineCreationFeedbackEXT *pipeline_feedback,
+                              VkPipelineCreationFeedback *pipeline_feedback,
                               const VkGraphicsPipelineCreateInfo *info,
                               const struct vk_graphics_pipeline_state *state)
 {
@@ -2676,18 +2679,6 @@ anv_pipeline_compile_cs(struct anv_compute_pipeline *pipeline,
    return VK_SUCCESS;
 }
 
-static VkPipelineCreateFlags2KHR
-get_pipeline_flags(VkPipelineCreateFlags flags, const void *pNext)
-{
-   const VkPipelineCreateFlags2CreateInfoKHR *flags2 =
-      vk_find_struct_const(pNext, PIPELINE_CREATE_FLAGS_2_CREATE_INFO_KHR);
-
-   if (flags2)
-      return flags2->flags;
-
-   return (VkPipelineCreateFlags2KHR)flags;
-}
-
 static VkResult
 anv_compute_pipeline_create(struct anv_device *device,
                             struct vk_pipeline_cache *cache,
@@ -2707,8 +2698,7 @@ anv_compute_pipeline_create(struct anv_device *device,
 
    result = anv_pipeline_init(&pipeline->base, device,
                               ANV_PIPELINE_COMPUTE,
-                              get_pipeline_flags(pCreateInfo->flags,
-                                                 pCreateInfo->pNext),
+                              vk_compute_pipeline_create_flags(pCreateInfo),
                               pAllocator);
    if (result != VK_SUCCESS) {
       vk_free2(&device->vk.alloc, pAllocator, pipeline);
@@ -2754,7 +2744,7 @@ VkResult anv_CreateComputePipelines(
    unsigned i;
    for (i = 0; i < count; i++) {
       const VkPipelineCreateFlags2KHR flags =
-         get_pipeline_flags(pCreateInfos[i].flags, pCreateInfos[i].pNext);
+         vk_compute_pipeline_create_flags(&pCreateInfos[i]);
       VkResult res = anv_compute_pipeline_create(device, pipeline_cache,
                                                  &pCreateInfos[i],
                                                  pAllocator, &pPipelines[i]);
@@ -3011,8 +3001,8 @@ anv_graphics_lib_pipeline_create(struct anv_device *device,
                                  VkPipeline *pPipeline)
 {
    struct anv_pipeline_stage stages[ANV_GRAPHICS_SHADER_STAGE_COUNT] = {};
-   VkPipelineCreationFeedbackEXT pipeline_feedback = {
-      .flags = VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT_EXT,
+   VkPipelineCreationFeedback pipeline_feedback = {
+      .flags = VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT,
    };
    int64_t pipeline_start = os_time_get_nano();
 
@@ -3020,7 +3010,7 @@ anv_graphics_lib_pipeline_create(struct anv_device *device,
    VkResult result;
 
    const VkPipelineCreateFlags2KHR flags =
-      get_pipeline_flags(pCreateInfo->flags, pCreateInfo->pNext);
+      vk_graphics_pipeline_create_flags(pCreateInfo);
    assert(flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR);
 
    const VkPipelineLibraryCreateInfoKHR *libs_info =
@@ -3037,7 +3027,7 @@ anv_graphics_lib_pipeline_create(struct anv_device *device,
                               pAllocator);
    if (result != VK_SUCCESS) {
       vk_free2(&device->vk.alloc, pAllocator, pipeline);
-      if (result == VK_PIPELINE_COMPILE_REQUIRED_EXT)
+      if (result == VK_PIPELINE_COMPILE_REQUIRED)
          *pPipeline = VK_NULL_HANDLE;
       return result;
    }
@@ -3063,7 +3053,8 @@ anv_graphics_lib_pipeline_create(struct anv_device *device,
 
    result = vk_graphics_pipeline_state_fill(&device->vk,
                                             &pipeline->state, pCreateInfo,
-                                            NULL /* sp_info */,
+                                            NULL /* driver_rp */,
+                                            0 /* driver_rp_flags */,
                                             &pipeline->all_state, NULL, 0, NULL);
    if (result != VK_SUCCESS) {
       anv_pipeline_finish(&pipeline->base.base, device);
@@ -3120,8 +3111,8 @@ anv_graphics_pipeline_create(struct anv_device *device,
                              VkPipeline *pPipeline)
 {
    struct anv_pipeline_stage stages[ANV_GRAPHICS_SHADER_STAGE_COUNT] = {};
-   VkPipelineCreationFeedbackEXT pipeline_feedback = {
-      .flags = VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT_EXT,
+   VkPipelineCreationFeedback pipeline_feedback = {
+      .flags = VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT,
    };
    int64_t pipeline_start = os_time_get_nano();
 
@@ -3129,7 +3120,7 @@ anv_graphics_pipeline_create(struct anv_device *device,
    VkResult result;
 
    const VkPipelineCreateFlags2KHR flags =
-      get_pipeline_flags(pCreateInfo->flags, pCreateInfo->pNext);
+      vk_graphics_pipeline_create_flags(pCreateInfo);
    assert((flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) == 0);
 
    const VkPipelineLibraryCreateInfoKHR *libs_info =
@@ -3179,7 +3170,8 @@ anv_graphics_pipeline_create(struct anv_device *device,
    }
 
    result = vk_graphics_pipeline_state_fill(&device->vk, &state, pCreateInfo,
-                                            NULL /* sp_info */,
+                                            NULL /* driver_rp */,
+                                            0 /* driver_rp_flags */,
                                             &all, NULL, 0, NULL);
    if (result != VK_SUCCESS) {
       anv_pipeline_finish(&pipeline->base.base, device);
@@ -3266,7 +3258,7 @@ VkResult anv_CreateGraphicsPipelines(
       assert(pCreateInfos[i].sType == VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO);
 
       const VkPipelineCreateFlags2KHR flags =
-         get_pipeline_flags(pCreateInfos[i].flags, pCreateInfos[i].pNext);
+         vk_graphics_pipeline_create_flags(&pCreateInfos[i]);
       VkResult res;
       if (flags & VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) {
          res = anv_graphics_lib_pipeline_create(device, pipeline_cache,
@@ -4018,8 +4010,7 @@ anv_ray_tracing_pipeline_create(
 
    result = anv_pipeline_init(&pipeline->base, device,
                               ANV_PIPELINE_RAY_TRACING,
-                              get_pipeline_flags(pCreateInfo->flags,
-                                                 pCreateInfo->pNext),
+                              vk_rt_pipeline_create_flags(pCreateInfo),
                               pAllocator);
    if (result != VK_SUCCESS) {
       vk_free2(&device->vk.alloc, pAllocator, pipeline);
@@ -4135,7 +4126,7 @@ anv_CreateRayTracingPipelinesKHR(
    unsigned i;
    for (i = 0; i < createInfoCount; i++) {
       const VkPipelineCreateFlags2KHR flags =
-         get_pipeline_flags(pCreateInfos[i].flags, pCreateInfos[i].pNext);
+         vk_rt_pipeline_create_flags(&pCreateInfos[i]);
       VkResult res = anv_ray_tracing_pipeline_create(_device, pipeline_cache,
                                                      &pCreateInfos[i],
                                                      pAllocator, &pPipelines[i]);

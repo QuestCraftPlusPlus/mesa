@@ -47,7 +47,7 @@ _eglInitThreadInfo(_EGLThreadInfo *t)
 {
    t->LastError = EGL_SUCCESS;
    /* default, per EGL spec */
-   t->CurrentAPI = EGL_OPENGL_API;
+   t->CurrentAPI = EGL_OPENGL_ES_API;
 }
 
 /**

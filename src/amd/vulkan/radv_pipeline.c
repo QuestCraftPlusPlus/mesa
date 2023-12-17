@@ -157,9 +157,12 @@ radv_generate_pipeline_key(const struct radv_device *device, const VkPipelineSha
    key.disable_aniso_single_level =
       device->instance->disable_aniso_single_level && device->physical_device->rad_info.gfx_level < GFX8;
 
+   key.disable_trunc_coord = device->disable_trunc_coord;
+
    key.image_2d_view_of_3d = device->image_2d_view_of_3d && device->physical_device->rad_info.gfx_level == GFX9;
 
    key.tex_non_uniform = device->instance->tex_non_uniform;
+   key.ssbo_non_uniform = device->instance->ssbo_non_uniform;
 
    for (unsigned i = 0; i < num_stages; ++i) {
       const VkPipelineShaderStageCreateInfo *const stage = &stages[i];
@@ -214,6 +217,11 @@ radv_generate_pipeline_key(const struct radv_device *device, const VkPipelineSha
          key.vertex_robustness1 = 1u;
    }
 
+   for (uint32_t i = 0; i < num_stages; i++) {
+      if (stages[i].stage == VK_SHADER_STAGE_MESH_BIT_EXT && device->mesh_fast_launch_2)
+         key.mesh_fast_launch_2 = 1u;
+   }
+
    return key;
 }
 
@@ -242,8 +250,6 @@ radv_get_hash_flags(const struct radv_device *device, bool stats)
       hash_flags |= RADV_HASH_SHADER_SPLIT_FMA;
    if (device->instance->debug_flags & RADV_DEBUG_NO_FMASK)
       hash_flags |= RADV_HASH_SHADER_NO_FMASK;
-   if (device->physical_device->use_ngg_streamout)
-      hash_flags |= RADV_HASH_SHADER_NGG_STREAMOUT;
    if (device->instance->debug_flags & RADV_DEBUG_NO_RT)
       hash_flags |= RADV_HASH_SHADER_NO_RT;
    if (device->instance->dual_color_blend_by_location)
@@ -484,38 +490,7 @@ opt_vectorize_callback(const nir_instr *instr, const void *_)
    if (bit_size != 16)
       return 1;
 
-   switch (alu->op) {
-   case nir_op_fadd:
-   case nir_op_fsub:
-   case nir_op_fmul:
-   case nir_op_ffma:
-   case nir_op_fdiv:
-   case nir_op_flrp:
-   case nir_op_fabs:
-   case nir_op_fneg:
-   case nir_op_fsat:
-   case nir_op_fmin:
-   case nir_op_fmax:
-   case nir_op_iabs:
-   case nir_op_iadd:
-   case nir_op_iadd_sat:
-   case nir_op_uadd_sat:
-   case nir_op_isub:
-   case nir_op_isub_sat:
-   case nir_op_usub_sat:
-   case nir_op_ineg:
-   case nir_op_imul:
-   case nir_op_imin:
-   case nir_op_imax:
-   case nir_op_umin:
-   case nir_op_umax:
-      return 2;
-   case nir_op_ishl: /* TODO: in NIR, these have 32bit shift operands */
-   case nir_op_ishr: /* while Radeon needs 16bit operands when vectorized */
-   case nir_op_ushr:
-   default:
-      return 1;
-   }
+   return aco_nir_op_supports_packed_math_16bit(alu) ? 2 : 1;
 }
 
 static nir_component_mask_t
@@ -617,7 +592,8 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_pipeline_key 
    NIR_PASS(_, stage->nir, ac_nir_lower_tex,
             &(ac_nir_lower_tex_options){
                .gfx_level = gfx_level,
-               .lower_array_layer_round_even = !device->physical_device->rad_info.conformant_trunc_coord,
+               .lower_array_layer_round_even =
+                  !device->physical_device->rad_info.conformant_trunc_coord || device->disable_trunc_coord,
                .fix_derivs_in_divergent_cf = fix_derivs_in_divergent_cf,
                .max_wqm_vgprs = 64, // TODO: improve spiller and RA support for linear VGPRs
             });
@@ -663,7 +639,7 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_pipeline_key 
          NIR_PASS_V(stage->nir, ac_nir_lower_legacy_vs, gfx_level,
                     stage->info.outinfo.clip_dist_mask | stage->info.outinfo.cull_dist_mask,
                     stage->info.outinfo.vs_output_param_offset, stage->info.outinfo.param_exports,
-                    stage->info.outinfo.export_prim_id, false, false, stage->info.force_vrs_per_vertex);
+                    stage->info.outinfo.export_prim_id, false, false, false, stage->info.force_vrs_per_vertex);
 
       } else {
          bool emulate_ngg_gs_query_pipeline_stat = device->physical_device->emulate_ngg_gs_query_pipeline_stat;
@@ -680,28 +656,34 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_pipeline_key 
          .family = device->physical_device->rad_info.family,
          .use_aco = !radv_use_llvm_for_stage(device, stage->stage),
          .uses_discard = true,
-         /* Compared to radv_pipeline_key.ps.alpha_to_coverage_via_mrtz,
-          * radv_shader_info.ps.writes_mrt0_alpha need any depth/stencil/sample_mask exist.
-          * ac_nir_lower_ps() require this field to reflect whether alpha via mrtz is really
-          * present.
-          */
-         .alpha_to_coverage_via_mrtz = stage->info.ps.writes_mrt0_alpha,
-         .dual_src_blend_swizzle = pipeline_key->ps.epilog.mrt0_is_dual_src && gfx_level >= GFX11,
-         /* Need to filter out unwritten color slots. */
-         .spi_shader_col_format = pipeline_key->ps.epilog.spi_shader_col_format & stage->info.ps.colors_written,
-         .color_is_int8 = pipeline_key->ps.epilog.color_is_int8,
-         .color_is_int10 = pipeline_key->ps.epilog.color_is_int10,
          .alpha_func = COMPARE_FUNC_ALWAYS,
-
-         .enable_mrt_output_nan_fixup =
-            pipeline_key->ps.epilog.enable_mrt_output_nan_fixup && !stage->nir->info.internal,
          .no_color_export = stage->info.has_epilog,
+         .no_depth_export = stage->info.ps.exports_mrtz_via_epilog,
 
          .bc_optimize_for_persp = G_0286CC_PERSP_CENTER_ENA(stage->info.ps.spi_ps_input) &&
                                   G_0286CC_PERSP_CENTROID_ENA(stage->info.ps.spi_ps_input),
          .bc_optimize_for_linear = G_0286CC_LINEAR_CENTER_ENA(stage->info.ps.spi_ps_input) &&
                                    G_0286CC_LINEAR_CENTROID_ENA(stage->info.ps.spi_ps_input),
       };
+
+      if (!options.no_color_export) {
+         options.dual_src_blend_swizzle = pipeline_key->ps.epilog.mrt0_is_dual_src && gfx_level >= GFX11;
+         options.color_is_int8 = pipeline_key->ps.epilog.color_is_int8;
+         options.color_is_int10 = pipeline_key->ps.epilog.color_is_int10;
+         options.enable_mrt_output_nan_fixup =
+            pipeline_key->ps.epilog.enable_mrt_output_nan_fixup && !stage->nir->info.internal;
+         /* Need to filter out unwritten color slots. */
+         options.spi_shader_col_format = pipeline_key->ps.epilog.spi_shader_col_format & stage->info.ps.colors_written;
+      }
+
+      if (!options.no_depth_export) {
+         /* Compared to radv_pipeline_key.ps.alpha_to_coverage_via_mrtz,
+          * radv_shader_info.ps.writes_mrt0_alpha need any depth/stencil/sample_mask exist.
+          * ac_nir_lower_ps() require this field to reflect whether alpha via mrtz is really
+          * present.
+          */
+         options.alpha_to_coverage_via_mrtz = stage->info.ps.writes_mrt0_alpha;
+      }
 
       NIR_PASS_V(stage->nir, ac_nir_lower_ps, &options);
    }
@@ -725,6 +707,8 @@ radv_postprocess_nir(struct radv_device *device, const struct radv_pipeline_key 
               device->physical_device->rad_info.address32_hi);
    radv_optimize_nir_algebraic(
       stage->nir, io_to_mem || lowered_ngg || stage->stage == MESA_SHADER_COMPUTE || stage->stage == MESA_SHADER_TASK);
+
+   NIR_PASS(_, stage->nir, nir_lower_fp16_casts, nir_lower_fp16_split_fp64);
 
    if (stage->nir->info.bit_sizes_int & (8 | 16)) {
       if (gfx_level >= GFX8) {

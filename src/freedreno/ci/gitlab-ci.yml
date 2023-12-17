@@ -80,7 +80,7 @@ a618_gl:
 
 # Run dEQP EGL window system tests separately with the window systems available.
 # X11 takes over the screen, wayland is run headless.
-.a618_egl:  # FIXME disabled due to device outage
+a618_egl:
   extends:
     - .lava-test-deqp:arm64
     - .a618-test-limozeen-nots-r5
@@ -102,7 +102,7 @@ a618_skqp:
     HWCI_START_XORG: 1
     DEQP_SUITE: freedreno-a618-skqp
 
-.a618_piglit_gles2:  # FIXME disabled due to device outage
+a618_piglit:
   extends:
     - .piglit-test
     - .lava-piglit:arm64
@@ -112,7 +112,6 @@ a618_skqp:
     - .collabora-freedreno-turnip-rules
   variables:
     HWCI_START_WESTON: 1
-    DEQP_VER: gles2
     PIGLIT_PROFILES: gpu
 
 a618-traces:
@@ -131,7 +130,7 @@ a618-traces:
     # missing.
     MESA_GLSL_VERSION_OVERRIDE: "460"
     MESA_GL_VERSION_OVERRIDE: "4.6"
-    PIGLIT_REPLAY_DESCRIPTION_FILE: "/install/traces-freedreno.yml"
+    PIGLIT_TRACES_FILE: traces-freedreno.yml
 
 a618-traces-performance:
   extends:
@@ -207,12 +206,13 @@ a630_vk:
   variables:
     DEQP_SUITE: freedreno-a630-vk
 
+
 a630_vk_full:
   # We use a longer timeout (3 hour job) to keep the parallel down so that we
   # don't lock up too many runners for a long time when a dev is testing full VK
   # status.  The full runs are restricted to just 2 runners to keep from
   # blocking up normal merges, so going more parallel doesn't make any sense.
-  timeout: 3h
+  timeout: 4.5h
   extends:
     - a630_vk
     - .a630-full
@@ -261,7 +261,7 @@ a630-traces-restricted:
     - a630-traces
     - .google-freedreno-rules-restricted
   variables:
-    PIGLIT_REPLAY_DESCRIPTION_FILE: "/install/restricted-traces-freedreno.yml"
+    PIGLIT_TRACES_FILE: restricted-traces-freedreno.yml
     PIGLIT_REPLAY_EXTRA_ARGS: "--download-caching-proxy-url=http://10.42.0.1:8888/cache/?uri= --db-path ${CI_PROJECT_DIR}/replayer-db/ --minio_bucket=mesa-tracie-private --jwt-file=${CI_JOB_JWT_FILE}"
   allow_failure: true
 

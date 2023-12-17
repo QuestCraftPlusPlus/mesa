@@ -56,7 +56,6 @@ static const struct debug_named_value radeonsi_debug_options[] = {
    /* Shader compiler options the shader cache should be aware of: */
    {"w32ge", DBG(W32_GE), "Use Wave32 for vertex, tessellation, and geometry shaders."},
    {"w32ps", DBG(W32_PS), "Use Wave32 for pixel shaders."},
-   {"w32psdiscard", DBG(W32_PS_DISCARD), "Use Wave32 for pixel shaders even if they contain discard and LLVM is buggy."},
    {"w32cs", DBG(W32_CS), "Use Wave32 for computes shaders."},
    {"w64ge", DBG(W64_GE), "Use Wave64 for vertex, tessellation, and geometry shaders."},
    {"w64ps", DBG(W64_PS), "Use Wave64 for pixel shaders."},
@@ -90,7 +89,6 @@ static const struct debug_named_value radeonsi_debug_options[] = {
    { "noefc", DBG(NO_EFC), "Disable hardware based encoder colour format conversion."},
 
    /* 3D engine options: */
-   {"nogfx", DBG(NO_GFX), "Disable graphics. Only multimedia compute paths can be used."},
    {"nongg", DBG(NO_NGG), "Disable NGG and use the legacy pipeline."},
    {"nggc", DBG(ALWAYS_NGG_CULLING_ALL), "Always use NGG culling even when it can hurt."},
    {"nonggc", DBG(NO_NGG_CULLING), "Disable NGG culling."},
@@ -277,6 +275,8 @@ static void si_destroy_context(struct pipe_context *context)
       sctx->b.delete_compute_state(&sctx->b, sctx->cs_clear_buffer_rmw);
    if (sctx->cs_copy_buffer)
       sctx->b.delete_compute_state(&sctx->b, sctx->cs_copy_buffer);
+   if (sctx->cs_ubyte_to_ushort)
+      sctx->b.delete_compute_state(&sctx->b, sctx->cs_ubyte_to_ushort);
    for (unsigned i = 0; i < ARRAY_SIZE(sctx->cs_copy_image); i++) {
       for (unsigned j = 0; j < ARRAY_SIZE(sctx->cs_copy_image[i]); j++) {
          for (unsigned k = 0; k < ARRAY_SIZE(sctx->cs_copy_image[i][j]); k++) {
@@ -447,7 +447,7 @@ static void si_set_debug_callback(struct pipe_context *ctx, const struct util_de
    struct si_screen *screen = sctx->screen;
 
    util_queue_finish(&screen->shader_compiler_queue);
-   util_queue_finish(&screen->shader_compiler_queue_low_priority);
+   util_queue_finish(&screen->shader_compiler_queue_opt_variants);
 
    if (cb)
       sctx->debug = *cb;
@@ -722,7 +722,8 @@ static struct pipe_context *si_create_context(struct pipe_screen *screen, unsign
        ((sscreen->info.vcn_ip_version >= VCN_4_0_0) ?
 	 sscreen->info.ip[AMD_IP_VCN_UNIFIED].num_queues : sscreen->info.ip[AMD_IP_VCN_DEC].num_queues) ||
        sscreen->info.ip[AMD_IP_VCN_JPEG].num_queues || sscreen->info.ip[AMD_IP_VCE].num_queues ||
-       sscreen->info.ip[AMD_IP_UVD_ENC].num_queues || sscreen->info.ip[AMD_IP_VCN_ENC].num_queues) {
+       sscreen->info.ip[AMD_IP_UVD_ENC].num_queues || sscreen->info.ip[AMD_IP_VCN_ENC].num_queues ||
+       sscreen->info.ip[AMD_IP_VPE].num_queues) {
       sctx->b.create_video_codec = si_uvd_create_decoder;
       sctx->b.create_video_buffer = si_video_buffer_create;
       if (screen->resource_create_with_modifiers)
@@ -842,14 +843,12 @@ static struct pipe_context *si_create_context(struct pipe_screen *screen, unsign
 
          if (status != PIPE_NO_RESET) {
             /* We lost the aux_context, create a new one */
+            unsigned context_flags = saux->context_flags;
             struct u_log_context *aux_log = saux->log;
             saux->b.set_log_context(&saux->b, NULL);
             saux->b.destroy(&saux->b);
 
-            saux = (struct si_context *)si_create_context(
-               &sscreen->b, SI_CONTEXT_FLAG_AUX |
-                            (sscreen->options.aux_debug ? PIPE_CONTEXT_DEBUG : 0) |
-                            (sscreen->info.has_graphics ? 0 : PIPE_CONTEXT_COMPUTE_ONLY));
+            saux = (struct si_context *)si_create_context(&sscreen->b, context_flags);
             saux->b.set_log_context(&saux->b, aux_log);
 
             sscreen->aux_contexts[i].ctx = &saux->b;
@@ -1004,7 +1003,7 @@ static void si_destroy_screen(struct pipe_screen *pscreen)
    }
 
    util_queue_destroy(&sscreen->shader_compiler_queue);
-   util_queue_destroy(&sscreen->shader_compiler_queue_low_priority);
+   util_queue_destroy(&sscreen->shader_compiler_queue_opt_variants);
 
    /* Release the reference on glsl types of the compiler threads. */
    glsl_type_singleton_decref();
@@ -1194,6 +1193,7 @@ static struct pipe_screen *radeonsi_screen_create_impl(struct radeon_winsys *ws,
                            &sscreen->pa_sc_raster_config_1, &sscreen->se_tile_repeat);
    }
 
+   sscreen->context_roll_log_filename = debug_get_option("AMD_ROLLS", NULL);
    sscreen->debug_flags = debug_get_flags_option("R600_DEBUG", radeonsi_debug_options, 0);
    sscreen->debug_flags |= debug_get_flags_option("AMD_DEBUG", radeonsi_debug_options, 0);
    test_flags = debug_get_flags_option("AMD_TEST", test_options, 0);
@@ -1203,13 +1203,9 @@ static struct pipe_screen *radeonsi_screen_create_impl(struct radeon_winsys *ws,
       sscreen->info.use_display_dcc_with_retile_blit = false;
    }
 
-   if (sscreen->debug_flags & DBG(SHADOW_REGS)) {
+   /* Using the environment variable doesn't enable PAIRS packets for simplicity. */
+   if (sscreen->debug_flags & DBG(SHADOW_REGS))
       sscreen->info.register_shadowing_required = true;
-      /* Recompute has_set_pairs_packets. */
-      sscreen->info.has_set_pairs_packets = sscreen->info.gfx_level >= GFX11 &&
-                                            sscreen->info.register_shadowing_required &&
-                                            sscreen->info.has_dedicated_vram;
-   }
 
 #ifdef LLVM_AVAILABLE
    sscreen->use_aco = (sscreen->debug_flags & DBG(USE_ACO));
@@ -1223,9 +1219,6 @@ static struct pipe_screen *radeonsi_screen_create_impl(struct radeon_winsys *ws,
       FREE(sscreen);
       return NULL;
    }
-
-   if (sscreen->debug_flags & DBG(NO_GFX))
-      sscreen->info.has_graphics = false;
 
    if ((sscreen->debug_flags & DBG(TMZ)) &&
        !sscreen->info.has_tmz_support) {
@@ -1346,7 +1339,7 @@ static struct pipe_screen *radeonsi_screen_create_impl(struct radeon_winsys *ws,
    if (!util_queue_init(&sscreen->shader_compiler_queue, "sh", num_slots,
                         num_comp_hi_threads,
                         UTIL_QUEUE_INIT_RESIZE_IF_FULL |
-                           UTIL_QUEUE_INIT_SET_FULL_THREAD_AFFINITY, NULL)) {
+                        UTIL_QUEUE_INIT_SET_FULL_THREAD_AFFINITY, NULL)) {
       si_destroy_shader_cache(sscreen);
       FREE(sscreen->nir_options);
       FREE(sscreen);
@@ -1354,11 +1347,10 @@ static struct pipe_screen *radeonsi_screen_create_impl(struct radeon_winsys *ws,
       return NULL;
    }
 
-   if (!util_queue_init(&sscreen->shader_compiler_queue_low_priority, "shlo", num_slots,
+   if (!util_queue_init(&sscreen->shader_compiler_queue_opt_variants, "sh_opt", num_slots,
                         num_comp_lo_threads,
                         UTIL_QUEUE_INIT_RESIZE_IF_FULL |
-                           UTIL_QUEUE_INIT_SET_FULL_THREAD_AFFINITY |
-                           UTIL_QUEUE_INIT_USE_MINIMUM_PRIORITY, NULL)) {
+                        UTIL_QUEUE_INIT_SET_FULL_THREAD_AFFINITY, NULL)) {
       si_destroy_shader_cache(sscreen);
       FREE(sscreen->nir_options);
       FREE(sscreen);
@@ -1424,13 +1416,29 @@ static struct pipe_screen *radeonsi_screen_create_impl(struct radeon_winsys *ws,
                             sscreen->debug_flags & DBG(DPBB));
 
    if (sscreen->dpbb_allowed) {
-      /* Only bin draws that have no CONTEXT and SH register changes between them because higher
-       * settings cause hangs. We've only been able to reproduce hangs on smaller chips
-       * (e.g. Navi24, GFX1103), though all chips might have them. What we see may be due to
-       * a driver bug.
-       */
-      sscreen->pbb_context_states_per_bin = 1;
-      sscreen->pbb_persistent_states_per_bin = 1;
+      if ((sscreen->info.has_dedicated_vram && sscreen->info.max_render_backends > 4) ||
+	  sscreen->info.gfx_level >= GFX10) {
+	 /* Only bin draws that have no CONTEXT and SH register changes between
+	  * them because higher settings cause hangs. We've only been able to
+	  * reproduce hangs on smaller chips (e.g. Navi24, GFX1103), though all
+	  * chips might have them. What we see may be due to a driver bug.
+	  */
+         sscreen->pbb_context_states_per_bin = 1;
+         sscreen->pbb_persistent_states_per_bin = 1;
+      } else {
+         /* This is a workaround for:
+          *    https://bugs.freedesktop.org/show_bug.cgi?id=110214
+          * (an alternative is to insert manual BATCH_BREAK event when
+          *  a context_roll is detected). */
+         sscreen->pbb_context_states_per_bin = sscreen->info.has_gfx9_scissor_bug ? 1 : 3;
+         sscreen->pbb_persistent_states_per_bin = 8;
+      }
+
+      if (!sscreen->info.has_gfx9_scissor_bug)
+         sscreen->pbb_context_states_per_bin =
+            debug_get_num_option("AMD_DEBUG_DPBB_CS", sscreen->pbb_context_states_per_bin);
+      sscreen->pbb_persistent_states_per_bin =
+         debug_get_num_option("AMD_DEBUG_DPBB_PS", sscreen->pbb_persistent_states_per_bin);
 
       assert(sscreen->pbb_context_states_per_bin >= 1 &&
              sscreen->pbb_context_states_per_bin <= 6);
@@ -1490,11 +1498,13 @@ static struct pipe_screen *radeonsi_screen_create_impl(struct radeon_winsys *ws,
    for (unsigned i = 0; i < ARRAY_SIZE(sscreen->aux_contexts); i++) {
       (void)mtx_init(&sscreen->aux_contexts[i].lock, mtx_plain | mtx_recursive);
 
+      bool compute = !sscreen->info.has_graphics ||
+                     &sscreen->aux_contexts[i] == &sscreen->aux_context.shader_upload;
       sscreen->aux_contexts[i].ctx =
          si_create_context(&sscreen->b,
                            SI_CONTEXT_FLAG_AUX | PIPE_CONTEXT_LOSE_CONTEXT_ON_RESET |
                            (sscreen->options.aux_debug ? PIPE_CONTEXT_DEBUG : 0) |
-                           (sscreen->info.has_graphics ? 0 : PIPE_CONTEXT_COMPUTE_ONLY));
+                           (compute ? PIPE_CONTEXT_COMPUTE_ONLY : 0));
 
       if (sscreen->options.aux_debug) {
          struct u_log_context *log = CALLOC_STRUCT(u_log_context);

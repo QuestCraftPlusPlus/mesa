@@ -87,6 +87,14 @@ static int ruvd_dec_get_decoder_fence(struct pipe_video_codec *decoder,
    return dec->ws->fence_wait(dec->ws, fence, timeout);
 }
 
+static void ruvd_dec_destroy_fence(struct pipe_video_codec *decoder,
+                                   struct pipe_fence_handle *fence)
+{
+   struct ruvd_decoder *dec = (struct ruvd_decoder *)decoder;
+
+   dec->ws->fence_reference(&fence, NULL);
+}
+
 /* add a new set register command to the IB */
 static void set_reg(struct ruvd_decoder *dec, unsigned reg, uint32_t val)
 {
@@ -725,7 +733,7 @@ static struct ruvd_h265 get_h265_msg(struct ruvd_decoder *dec, struct pipe_video
 
    for (i = 0; i < 2; i++) {
       for (j = 0; j < 15; j++)
-         result.direct_reflist[i][j] = pic->RefPicList[i][j];
+         result.direct_reflist[i][j] = pic->RefPicList[0][i][j];
    }
 
    if (pic->base.profile == PIPE_VIDEO_PROFILE_HEVC_MAIN_10) {
@@ -1251,6 +1259,7 @@ struct pipe_video_codec *si_common_uvd_create_decoder(struct pipe_context *conte
    dec->base.end_frame = ruvd_end_frame;
    dec->base.flush = ruvd_flush;
    dec->base.get_decoder_fence = ruvd_dec_get_decoder_fence;
+   dec->base.destroy_fence = ruvd_dec_destroy_fence;
 
    dec->stream_type = profile2stream_type(dec, sctx->family);
    dec->set_dtb = set_dtb;

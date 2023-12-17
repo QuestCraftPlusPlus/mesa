@@ -1,6 +1,9 @@
 .virgl-rules:
   stage: layered-backends
   rules:
+    - !reference [.test, rules]
+    - if: $FORCE_KERNEL_TAG != null
+      when: never
     - !reference [.gl-rules, rules]
     - !reference [.llvmpipe-rules, rules]
     - changes: &virgl_file_list
@@ -12,6 +15,7 @@
   stage: layered-backends
   retry: !reference [.scheduled_pipeline-rules, retry]
   rules:
+    - !reference [.test, rules]
     - !reference [.collabora-farm-manual-rules, rules]
     - !reference [.gl-manual-rules, rules]
     - changes:
@@ -23,6 +27,7 @@
   stage: layered-backends
   retry: !reference [.scheduled_pipeline-rules, retry]
   rules:
+    - !reference [.test, rules]
     - !reference [.collabora-farm-manual-rules, rules]
     - !reference [.performance-rules, rules]
     - !reference [.gl-manual-rules, rules]
@@ -75,5 +80,5 @@
     CROSVM_GPU_ARGS: "gles=false,backend=virglrenderer,egl=true,surfaceless=true,width=1024,height=768"
     EGL_PLATFORM: surfaceless
     PIGLIT_PROFILES: replay
-    PIGLIT_REPLAY_DESCRIPTION_FILE: "/install/traces-virgl-iris.yml"
+    PIGLIT_TRACES_FILE: traces-virgl-iris.yml
     RUNNER_TAG: mesa-ci-x86-64-lava-asus-cx9400-volteer

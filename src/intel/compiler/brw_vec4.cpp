@@ -290,15 +290,28 @@ vec4_instruction::can_do_writemask(const struct intel_device_info *devinfo)
    case TES_OPCODE_ADD_INDIRECT_URB_OFFSET:
    case VEC4_OPCODE_URB_READ:
    case SHADER_OPCODE_MOV_INDIRECT:
+   case SHADER_OPCODE_TEX:
+   case FS_OPCODE_TXB:
+   case SHADER_OPCODE_TXD:
+   case SHADER_OPCODE_TXF:
+   case SHADER_OPCODE_TXF_LZ:
+   case SHADER_OPCODE_TXF_CMS:
+   case SHADER_OPCODE_TXF_CMS_W:
+   case SHADER_OPCODE_TXF_UMS:
+   case SHADER_OPCODE_TXF_MCS:
+   case SHADER_OPCODE_TXL:
+   case SHADER_OPCODE_TXL_LZ:
+   case SHADER_OPCODE_TXS:
+   case SHADER_OPCODE_LOD:
+   case SHADER_OPCODE_TG4:
+   case SHADER_OPCODE_TG4_OFFSET:
+   case SHADER_OPCODE_SAMPLEINFO:
       return false;
    default:
       /* The MATH instruction on Gfx6 only executes in align1 mode, which does
        * not support writemasking.
        */
       if (devinfo->ver == 6 && is_math())
-         return false;
-
-      if (is_tex())
          return false;
 
       return true;
@@ -1659,7 +1672,7 @@ vec4_visitor::get_timestamp()
                                 BRW_SWIZZLE_XYZW,
                                 WRITEMASK_XYZW));
 
-   dst_reg dst = dst_reg(this, glsl_type::uvec4_type);
+   dst_reg dst = dst_reg(this, glsl_uvec4_type());
 
    vec4_instruction *mov = emit(MOV(dst, ts));
    /* We want to read the 3 fields we care about (mostly field 0, but also 2)
@@ -2220,7 +2233,7 @@ vec4_visitor::lower_64bit_mad_to_mul_add()
       if (type_sz(inst->dst.type) != 8)
          continue;
 
-      dst_reg mul_dst = dst_reg(this, glsl_type::dvec4_type);
+      dst_reg mul_dst = dst_reg(this, glsl_dvec4_type());
 
       /* Use the copy constructor so we copy all relevant instruction fields
        * from the original mad into the add and mul instructions
@@ -2379,6 +2392,7 @@ vec4_visitor::run()
    emit_thread_end();
 
    calculate_cfg();
+   cfg->validate(_mesa_shader_stage_to_abbrev(stage));
 
    /* Before any optimization, push array accesses out to scratch
     * space where we need them to be.  This pass may allocate new
@@ -2404,6 +2418,7 @@ vec4_visitor::run()
          backend_shader::dump_instructions(filename);                  \
       }                                                                \
                                                                        \
+      cfg->validate(_mesa_shader_stage_to_abbrev(stage));              \
       progress = progress || this_progress;                            \
       this_progress;                                                   \
    })

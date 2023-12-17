@@ -41,22 +41,6 @@ LibGL environment variables
 Core Mesa environment variables
 -------------------------------
 
-.. envvar:: MESA_NO_ASM
-
-   if set, disables all assembly language optimizations
-
-.. envvar:: MESA_NO_MMX
-
-   if set, disables Intel MMX optimizations
-
-.. envvar:: MESA_NO_3DNOW
-
-   if set, disables AMD 3DNow! optimizations
-
-.. envvar:: MESA_NO_SSE
-
-   if set, disables Intel SSE optimizations
-
 .. envvar:: MESA_NO_ERROR
 
    if set to 1, error checking is disabled as per :ext:`GL_KHR_no_error`.
@@ -494,6 +478,12 @@ Intel driver environment variables
    for compute dispatches if one is detected. For Vulkan, anvil will
    advertise support for a compute queue if a compute engine is
    detected.
+
+.. envvar:: INTEL_COPY_CLASS
+
+   If set to 1, true or yes, then I915_ENGINE_CLASS_COPY will be
+   supported. For Vulkan, anvil will advertise support for a transfer
+   queue if a copy engine is detected.
 
 .. envvar:: INTEL_DEBUG
 
@@ -1063,6 +1053,7 @@ clc environment variables
 
    a comma-separated list of debug channels to enable.
 
+   - ``dump_llvm`` Dumps all generated LLVM IRs
    - ``dump_spirv`` Dumps all compiled, linked and specialized SPIR-Vs
    - ``verbose`` Enable debug logging of clc code
 
@@ -1259,6 +1250,8 @@ RADV driver environment variables
       disable directly recording command buffers in GPU-visible memory
    ``nomemorycache``
       disable memory shaders cache
+   ``nomeshshader``
+      disable mesh shader support on GFX10.3+
    ``nongg``
       disable NGG for GFX10 and GFX10.3
    ``nonggc``
@@ -1332,8 +1325,6 @@ RADV driver environment variables
       disable optimizations that get enabled when all VRAM is CPU visible.
    ``pswave32``
       enable wave32 for pixel shaders (GFX10+)
-   ``ngg_streamout``
-      enable NGG streamout
    ``nggc``
       enable NGG culling on GPUs where it's not enabled by default (GFX10.1 only).
    ``sam``
@@ -1342,6 +1333,8 @@ RADV driver environment variables
       enable wave64 for ray tracing shaders (GFX10+)
    ``video_decode``
       enable experimental video decoding support
+   ``gsfastlaunch2``
+      use GS_FAST_LAUNCH=2 for Mesh shaders (GFX11+)
 
 .. envvar:: RADV_TEX_ANISO
 
@@ -1354,11 +1347,15 @@ RADV driver environment variables
 
 .. envvar:: RADV_THREAD_TRACE_CACHE_COUNTERS
 
-   enable/disable SQTT/RGP cache counters on GFX10+ (disabled by default)
+   enable/disable SQTT/RGP cache counters on GFX10+ (enabled by default)
 
 .. envvar:: RADV_THREAD_TRACE_INSTRUCTION_TIMING
 
    enable/disable SQTT/RGP instruction timing (enabled by default)
+
+.. envvar:: RADV_THREAD_TRACE_QUEUE_EVENTS
+
+   enable/disable SQTT/RGP queue events (enabled by default)
 
 .. envvar:: RADV_RRA_TRACE_VALIDATE
 
@@ -1422,6 +1419,8 @@ RadeonSI driver environment variables
       Disable DCC for MSAA
    ``nodpbb``
       Disable DPBB. Overrules the dpbb enable option.
+   ``noefc``
+      Disable hardware based encoder colour format conversion
    ``notiling``
       Disable tiling
    ``nofmask``
@@ -1476,14 +1475,14 @@ RadeonSI driver environment variables
       Use old-style monolithic shaders compiled on demand
    ``nooptvariant``
       Disable compiling optimized shader variants.
+   ``useaco``
+      Use ACO as shader compiler when possible
    ``nowc``
       Disable GTT write combining
    ``check_vm``
       Check VM faults and dump debug info.
    ``reserve_vmid``
       Force VMID reservation per context.
-   ``nogfx``
-      Disable graphics. Only multimedia compute paths can be used.
    ``nongg``
       Disable NGG and use the legacy pipeline.
    ``nggc``

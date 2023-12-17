@@ -82,6 +82,8 @@ typedef void *drmDevicePtr;
 #include "ac_llvm_util.h"
 #endif
 
+#include "ac_debug.h"
+
 static bool
 radv_spm_trace_enabled(struct radv_instance *instance)
 {
@@ -154,37 +156,54 @@ radv_device_finish_border_color(struct radv_device *device)
    }
 }
 
+static struct radv_shader_part *
+_radv_create_vs_prolog(struct radv_device *device, const void *_key)
+{
+   struct radv_vs_prolog_key *key = (struct radv_vs_prolog_key *)_key;
+   return radv_create_vs_prolog(device, key);
+}
+
+static uint32_t
+radv_hash_vs_prolog(const void *key_)
+{
+   const struct radv_vs_prolog_key *key = key_;
+   return _mesa_hash_data(key, sizeof(*key));
+}
+
+static bool
+radv_cmp_vs_prolog(const void *a_, const void *b_)
+{
+   const struct radv_vs_prolog_key *a = a_;
+   const struct radv_vs_prolog_key *b = b_;
+
+   return memcmp(a, b, sizeof(*a)) == 0;
+}
+
+static struct radv_shader_part_cache_ops vs_prolog_ops = {
+   .create = _radv_create_vs_prolog,
+   .hash = radv_hash_vs_prolog,
+   .equals = radv_cmp_vs_prolog,
+};
+
 static VkResult
 radv_device_init_vs_prologs(struct radv_device *device)
 {
-   u_rwlock_init(&device->vs_prologs_lock);
-   device->vs_prologs = _mesa_hash_table_create(NULL, &radv_hash_vs_prolog, &radv_cmp_vs_prolog);
-   if (!device->vs_prologs)
+   if (!radv_shader_part_cache_init(&device->vs_prologs, &vs_prolog_ops))
       return vk_error(device->physical_device->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    /* don't pre-compile prologs if we want to print them */
    if (device->instance->debug_flags & RADV_DEBUG_DUMP_PROLOGS)
       return VK_SUCCESS;
 
-   struct radv_vs_input_state state;
-   state.nontrivial_divisors = 0;
-   memset(state.offsets, 0, sizeof(state.offsets));
-   state.alpha_adjust_lo = 0;
-   state.alpha_adjust_hi = 0;
-   memset(state.formats, 0, sizeof(state.formats));
-
    struct radv_vs_prolog_key key;
-   key.state = &state;
-   key.misaligned_mask = 0;
+   memset(&key, 0, sizeof(key));
    key.as_ls = false;
    key.is_ngg = device->physical_device->use_ngg;
    key.next_stage = MESA_SHADER_VERTEX;
    key.wave32 = device->physical_device->ge_wave_size == 32;
 
    for (unsigned i = 1; i <= MAX_VERTEX_ATTRIBS; i++) {
-      state.attribute_mask = BITFIELD_MASK(i);
-      state.instance_rate_inputs = 0;
-
+      key.instance_rate_inputs = 0;
       key.num_attributes = i;
 
       device->simple_vs_prologs[i - 1] = radv_create_vs_prolog(device, &key);
@@ -194,22 +213,16 @@ radv_device_init_vs_prologs(struct radv_device *device)
 
    unsigned idx = 0;
    for (unsigned num_attributes = 1; num_attributes <= 16; num_attributes++) {
-      state.attribute_mask = BITFIELD_MASK(num_attributes);
-
-      for (unsigned i = 0; i < num_attributes; i++)
-         state.divisors[i] = 1;
-
       for (unsigned count = 1; count <= num_attributes; count++) {
          for (unsigned start = 0; start <= (num_attributes - count); start++) {
-            state.instance_rate_inputs = u_bit_consecutive(start, count);
-
+            key.instance_rate_inputs = u_bit_consecutive(start, count);
             key.num_attributes = num_attributes;
 
             struct radv_shader_part *prolog = radv_create_vs_prolog(device, &key);
             if (!prolog)
                return vk_error(device->physical_device->instance, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
-            assert(idx == radv_instance_rate_prolog_index(num_attributes, state.instance_rate_inputs));
+            assert(idx == radv_instance_rate_prolog_index(num_attributes, key.instance_rate_inputs));
             device->instance_rate_vs_prologs[idx++] = prolog;
          }
       }
@@ -222,13 +235,8 @@ radv_device_init_vs_prologs(struct radv_device *device)
 static void
 radv_device_finish_vs_prologs(struct radv_device *device)
 {
-   if (device->vs_prologs) {
-      hash_table_foreach (device->vs_prologs, entry) {
-         free((void *)entry->key);
-         radv_shader_part_unref(device, entry->data);
-      }
-      _mesa_hash_table_destroy(device->vs_prologs, NULL);
-   }
+   if (device->vs_prologs.ops)
+      radv_shader_part_cache_finish(device, &device->vs_prologs);
 
    for (unsigned i = 0; i < ARRAY_SIZE(device->simple_vs_prologs); i++) {
       if (!device->simple_vs_prologs[i])
@@ -245,53 +253,63 @@ radv_device_finish_vs_prologs(struct radv_device *device)
    }
 }
 
-static VkResult
-radv_device_init_ps_epilogs(struct radv_device *device)
+static struct radv_shader_part *
+_radv_create_ps_epilog(struct radv_device *device, const void *_key)
 {
-   u_rwlock_init(&device->ps_epilogs_lock);
-
-   device->ps_epilogs = _mesa_hash_table_create(NULL, &radv_hash_ps_epilog, &radv_cmp_ps_epilog);
-   if (!device->ps_epilogs)
-      return vk_error(device->physical_device->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
-
-   return VK_SUCCESS;
+   struct radv_ps_epilog_key *key = (struct radv_ps_epilog_key *)_key;
+   return radv_create_ps_epilog(device, key, NULL);
 }
 
-static void
-radv_device_finish_ps_epilogs(struct radv_device *device)
+static uint32_t
+radv_hash_ps_epilog(const void *key_)
 {
-   if (device->ps_epilogs) {
-      hash_table_foreach (device->ps_epilogs, entry) {
-         free((void *)entry->key);
-         radv_shader_part_unref(device, entry->data);
-      }
-      _mesa_hash_table_destroy(device->ps_epilogs, NULL);
-   }
+   const struct radv_ps_epilog_key *key = key_;
+   return _mesa_hash_data(key, sizeof(*key));
 }
 
-static VkResult
-radv_device_init_tcs_epilogs(struct radv_device *device)
+static bool
+radv_cmp_ps_epilog(const void *a_, const void *b_)
 {
-   u_rwlock_init(&device->tcs_epilogs_lock);
+   const struct radv_ps_epilog_key *a = a_;
+   const struct radv_ps_epilog_key *b = b_;
 
-   device->tcs_epilogs = _mesa_hash_table_create(NULL, &radv_hash_tcs_epilog, &radv_cmp_tcs_epilog);
-   if (!device->tcs_epilogs)
-      return vk_error(device->physical_device->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
-
-   return VK_SUCCESS;
+   return memcmp(a, b, sizeof(*a)) == 0;
 }
 
-static void
-radv_device_finish_tcs_epilogs(struct radv_device *device)
+static struct radv_shader_part_cache_ops ps_epilog_ops = {
+   .create = _radv_create_ps_epilog,
+   .hash = radv_hash_ps_epilog,
+   .equals = radv_cmp_ps_epilog,
+};
+
+static struct radv_shader_part *
+_radv_create_tcs_epilog(struct radv_device *device, const void *_key)
 {
-   if (device->tcs_epilogs) {
-      hash_table_foreach (device->tcs_epilogs, entry) {
-         free((void *)entry->key);
-         radv_shader_part_unref(device, entry->data);
-      }
-      _mesa_hash_table_destroy(device->tcs_epilogs, NULL);
-   }
+   struct radv_tcs_epilog_key *key = (struct radv_tcs_epilog_key *)_key;
+   return radv_create_tcs_epilog(device, key);
 }
+
+static uint32_t
+radv_hash_tcs_epilog(const void *key_)
+{
+   const struct radv_tcs_epilog_key *key = key_;
+   return _mesa_hash_data(key, sizeof(*key));
+}
+
+static bool
+radv_cmp_tcs_epilog(const void *a_, const void *b_)
+{
+   const struct radv_tcs_epilog_key *a = a_;
+   const struct radv_tcs_epilog_key *b = b_;
+
+   return memcmp(a, b, sizeof(*a)) == 0;
+}
+
+static struct radv_shader_part_cache_ops tcs_epilog_ops = {
+   .create = _radv_create_tcs_epilog,
+   .hash = radv_hash_tcs_epilog,
+   .equals = radv_cmp_tcs_epilog,
+};
 
 VkResult
 radv_device_init_vrs_state(struct radv_device *device)
@@ -607,6 +625,7 @@ radv_report_gpuvm_fault(struct radv_device *device)
       return;
 
    fprintf(stderr, "radv: GPUVM fault detected at address 0x%08" PRIx64 ".\n", fault_info.addr);
+   ac_print_gpuvm_fault_status(stderr, device->physical_device->rad_info.gfx_level, fault_info.status);
 }
 
 static VkResult
@@ -707,11 +726,13 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
    bool use_dgc = false;
    bool smooth_lines = false;
    bool mesh_shader_queries = false;
+   bool dual_src_blend = false;
 
    /* Check enabled features */
    if (pCreateInfo->pEnabledFeatures) {
       if (pCreateInfo->pEnabledFeatures->robustBufferAccess)
          buffer_robustness = MAX2(buffer_robustness, RADV_BUFFER_ROBUSTNESS_1);
+      dual_src_blend = pCreateInfo->pEnabledFeatures->dualSrcBlend;
    }
 
    vk_foreach_struct_const (ext, pCreateInfo->pNext) {
@@ -720,6 +741,7 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
          const VkPhysicalDeviceFeatures2 *features = (const void *)ext;
          if (features->features.robustBufferAccess)
             buffer_robustness = MAX2(buffer_robustness, RADV_BUFFER_ROBUSTNESS_1);
+         dual_src_blend |= features->features.dualSrcBlend;
          break;
       }
       case VK_STRUCTURE_TYPE_DEVICE_MEMORY_OVERALLOCATION_CREATE_INFO_AMD: {
@@ -801,8 +823,10 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_GRAPHICS_PIPELINE_LIBRARY_FEATURES_EXT: {
          const VkPhysicalDeviceGraphicsPipelineLibraryFeaturesEXT *features = (const void *)ext;
-         if (features->graphicsPipelineLibrary)
+         if (features->graphicsPipelineLibrary) {
             vs_prologs = true;
+            ps_epilogs = true;
+         }
          break;
       }
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT: {
@@ -940,7 +964,8 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
    device->pbb_allowed =
       device->physical_device->rad_info.gfx_level >= GFX9 && !(device->instance->debug_flags & RADV_DEBUG_NOBINNING);
 
-   device->mesh_fast_launch_2 = device->physical_device->rad_info.gfx_level >= GFX11;
+   device->mesh_fast_launch_2 = (device->instance->perftest_flags & RADV_PERFTEST_GS_FAST_LAUNCH_2) &&
+                                device->physical_device->rad_info.gfx_level >= GFX11;
 
    /* The maximum number of scratch waves. Scratch space isn't divided
     * evenly between CUs. The number is only a function of the number of CUs.
@@ -964,6 +989,13 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
        * allow launching waves out-of-order.
        */
       device->dispatch_initiator |= S_00B800_ORDER_MODE(1);
+   }
+   if (device->physical_device->rad_info.gfx_level >= GFX10) {
+      /* Enable asynchronous compute tunneling. The KMD restricts this feature
+       * to high-priority compute queues, so setting the bit on any other queue
+       * is a no-op. PAL always sets this bit as well.
+       */
+      device->dispatch_initiator |= S_00B800_TUNNEL_ENABLE(1);
    }
 
    /* Disable partial preemption for task shaders.
@@ -1010,9 +1042,10 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
 
       fprintf(stderr,
               "radv: Thread trace support is enabled (initial buffer size: %u MiB, "
-              "instruction timing: %s, cache counters: %s).\n",
+              "instruction timing: %s, cache counters: %s, queue events: %s).\n",
               device->sqtt.buffer_size / (1024 * 1024), radv_is_instruction_timing_enabled() ? "enabled" : "disabled",
-              radv_spm_trace_enabled(device->instance) ? "enabled" : "disabled");
+              radv_spm_trace_enabled(device->instance) ? "enabled" : "disabled",
+              radv_sqtt_queue_events_enabled() ? "enabled" : "disabled");
 
       if (radv_spm_trace_enabled(device->instance)) {
          if (device->physical_device->rad_info.gfx_level >= GFX10) {
@@ -1098,15 +1131,17 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
    }
 
    if (tcs_epilogs) {
-      result = radv_device_init_tcs_epilogs(device);
-      if (result != VK_SUCCESS)
+      if (!radv_shader_part_cache_init(&device->tcs_epilogs, &tcs_epilog_ops)) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
          goto fail;
+      }
    }
 
    if (ps_epilogs) {
-      result = radv_device_init_ps_epilogs(device);
-      if (result != VK_SUCCESS)
+      if (!radv_shader_part_cache_init(&device->ps_epilogs, &ps_epilog_ops)) {
+         result = VK_ERROR_OUT_OF_HOST_MEMORY;
          goto fail;
+      }
    }
 
    if (!(device->instance->debug_flags & RADV_DEBUG_NO_IBS))
@@ -1122,6 +1157,17 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
    device->force_aniso = MIN2(16, (int)debug_get_num_option("RADV_TEX_ANISO", -1));
    if (device->force_aniso >= 0) {
       fprintf(stderr, "radv: Forcing anisotropy filter to %ix\n", 1 << util_logbase2(device->force_aniso));
+   }
+
+   device->disable_trunc_coord = device->instance->disable_trunc_coord;
+
+   if (device->instance->vk.app_info.engine_name && !strcmp(device->instance->vk.app_info.engine_name, "DXVK")) {
+      /* For DXVK 2.3.0 and older, use dualSrcBlend to determine if this is D3D9. */
+      bool is_d3d9 = !dual_src_blend;
+      if (device->instance->vk.app_info.engine_version > VK_MAKE_VERSION(2, 3, 0))
+         is_d3d9 = device->instance->vk.app_info.app_version & 0x1;
+
+      device->disable_trunc_coord &= !is_d3d9;
    }
 
    if (use_perf_counters) {
@@ -1175,8 +1221,10 @@ fail:
 
    radv_device_finish_notifier(device);
    radv_device_finish_vs_prologs(device);
-   radv_device_finish_tcs_epilogs(device);
-   radv_device_finish_ps_epilogs(device);
+   if (device->tcs_epilogs.ops)
+      radv_shader_part_cache_finish(device, &device->tcs_epilogs);
+   if (device->ps_epilogs.ops)
+      radv_shader_part_cache_finish(device, &device->ps_epilogs);
    radv_device_finish_border_color(device);
 
    radv_destroy_shader_upload_queue(device);
@@ -1228,8 +1276,10 @@ radv_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 
    radv_device_finish_notifier(device);
    radv_device_finish_vs_prologs(device);
-   radv_device_finish_tcs_epilogs(device);
-   radv_device_finish_ps_epilogs(device);
+   if (device->tcs_epilogs.ops)
+      radv_shader_part_cache_finish(device, &device->tcs_epilogs);
+   if (device->ps_epilogs.ops)
+      radv_shader_part_cache_finish(device, &device->ps_epilogs);
    radv_device_finish_border_color(device);
    radv_device_finish_vrs_image(device);
 
@@ -1282,9 +1332,13 @@ radv_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
 bool
 radv_get_memory_fd(struct radv_device *device, struct radv_device_memory *memory, int *pFD)
 {
-   /* Only set BO metadata for the first plane */
-   if (memory->image && memory->image->bindings[0].offset == 0) {
+   /* Set BO metadata for dedicated image allocations.  We don't need it for import when the image
+    * tiling is VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT, but we set it anyway for foreign consumers.
+    */
+   if (memory->image) {
       struct radeon_bo_metadata metadata;
+
+      assert(memory->image->bindings[0].offset == 0);
       radv_init_metadata(device, memory->image, &metadata);
       device->ws->buffer_set_metadata(device->ws, memory->bo, &metadata);
    }
@@ -1430,13 +1484,13 @@ radv_surface_max_layer_count(struct radv_image_view *iview)
                                                        : (iview->vk.base_array_layer + iview->vk.layer_count);
 }
 
-static unsigned
-get_dcc_max_uncompressed_block_size(const struct radv_device *device, const struct radv_image_view *iview)
+unsigned
+radv_get_dcc_max_uncompressed_block_size(const struct radv_device *device, const struct radv_image *image)
 {
-   if (device->physical_device->rad_info.gfx_level < GFX10 && iview->image->vk.samples > 1) {
-      if (iview->image->planes[0].surface.bpe == 1)
+   if (device->physical_device->rad_info.gfx_level < GFX10 && image->vk.samples > 1) {
+      if (image->planes[0].surface.bpe == 1)
          return V_028C78_MAX_BLOCK_SIZE_64B;
-      else if (iview->image->planes[0].surface.bpe == 2)
+      else if (image->planes[0].surface.bpe == 2)
          return V_028C78_MAX_BLOCK_SIZE_128B;
    }
 
@@ -1461,7 +1515,7 @@ get_dcc_min_compressed_block_size(const struct radv_device *device)
 static uint32_t
 radv_init_dcc_control_reg(struct radv_device *device, struct radv_image_view *iview)
 {
-   unsigned max_uncompressed_block_size = get_dcc_max_uncompressed_block_size(device, iview);
+   unsigned max_uncompressed_block_size = radv_get_dcc_max_uncompressed_block_size(device, iview->image);
    unsigned min_compressed_block_size = get_dcc_min_compressed_block_size(device);
    unsigned max_compressed_block_size;
    unsigned independent_128b_blocks;
@@ -1505,6 +1559,10 @@ radv_init_dcc_control_reg(struct radv_device *device, struct radv_image_view *iv
       result |= S_028C78_INDEPENDENT_128B_BLOCKS_GFX11(independent_128b_blocks) |
                 S_028C78_DISABLE_CONSTANT_ENCODE_REG(1) |
                 S_028C78_FDCC_ENABLE(radv_dcc_enabled(iview->image, iview->vk.base_mip_level));
+
+      if (device->physical_device->rad_info.family >= CHIP_GFX1103_R2) {
+         result |= S_028C78_ENABLE_MAX_COMP_FRAG_OVERRIDE(1) | S_028C78_MAX_COMP_FRAGS(iview->image->vk.samples >= 4);
+      }
    } else {
       result |= S_028C78_INDEPENDENT_128B_BLOCKS_GFX10(independent_128b_blocks);
    }
@@ -1686,11 +1744,7 @@ radv_initialise_color_surface(struct radv_device *device, struct radv_color_buff
       }
 
       if (radv_image_is_tc_compat_cmask(iview->image)) {
-         /* Allow the texture block to read FMASK directly
-          * without decompressing it. This bit must be cleared
-          * when performing FMASK_DECOMPRESS or DCC_COMPRESS,
-          * otherwise the operation doesn't happen.
-          */
+         /* Allow the texture block to read FMASK directly without decompressing it. */
          cb->cb_color_info |= S_028C70_FMASK_COMPRESS_1FRAG_ONLY(1);
 
          if (device->physical_device->rad_info.gfx_level == GFX8) {
@@ -1827,7 +1881,7 @@ radv_initialise_vrs_surface(struct radv_image *image, struct radv_buffer *htile_
 
 void
 radv_initialise_ds_surface(const struct radv_device *device, struct radv_ds_buffer_info *ds,
-                           struct radv_image_view *iview)
+                           struct radv_image_view *iview, VkImageAspectFlags ds_aspects)
 {
    unsigned level = iview->vk.base_mip_level;
    unsigned format, stencil_format;
@@ -1844,7 +1898,9 @@ radv_initialise_ds_surface(const struct radv_device *device, struct radv_ds_buff
    stencil_format = surf->has_stencil ? V_028044_STENCIL_8 : V_028044_STENCIL_INVALID;
 
    uint32_t max_slice = radv_surface_max_layer_count(iview) - 1;
-   ds->db_depth_view = S_028008_SLICE_START(iview->vk.base_array_layer) | S_028008_SLICE_MAX(max_slice);
+   ds->db_depth_view = S_028008_SLICE_START(iview->vk.base_array_layer) | S_028008_SLICE_MAX(max_slice) |
+                       S_028008_Z_READ_ONLY(!(ds_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) |
+                       S_028008_STENCIL_READ_ONLY(!(ds_aspects & VK_IMAGE_ASPECT_STENCIL_BIT));
    if (device->physical_device->rad_info.gfx_level >= GFX10) {
       ds->db_depth_view |=
          S_028008_SLICE_START_HI(iview->vk.base_array_layer >> 11) | S_028008_SLICE_MAX_HI(max_slice >> 11);
@@ -2018,8 +2074,7 @@ radv_gfx11_set_db_render_control(const struct radv_device *device, unsigned num_
          max_allowed_tiles_in_wave = 15;
    }
 
-   *db_render_control |=
-      S_028000_OREO_MODE(V_028000_OMODE_O_THEN_B) | S_028000_MAX_ALLOWED_TILES_IN_WAVE(max_allowed_tiles_in_wave);
+   *db_render_control |= S_028000_MAX_ALLOWED_TILES_IN_WAVE(max_allowed_tiles_in_wave);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -2115,8 +2170,8 @@ radv_GetMemoryFdPropertiesKHR(VkDevice _device, VkExternalMemoryHandleTypeFlagBi
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
-radv_GetCalibratedTimestampsEXT(VkDevice _device, uint32_t timestampCount,
-                                const VkCalibratedTimestampInfoEXT *pTimestampInfos, uint64_t *pTimestamps,
+radv_GetCalibratedTimestampsKHR(VkDevice _device, uint32_t timestampCount,
+                                const VkCalibratedTimestampInfoKHR *pTimestampInfos, uint64_t *pTimestamps,
                                 uint64_t *pMaxDeviation)
 {
 #ifndef _WIN32
@@ -2134,18 +2189,18 @@ radv_GetCalibratedTimestampsEXT(VkDevice _device, uint32_t timestampCount,
 
    for (d = 0; d < timestampCount; d++) {
       switch (pTimestampInfos[d].timeDomain) {
-      case VK_TIME_DOMAIN_DEVICE_EXT:
+      case VK_TIME_DOMAIN_DEVICE_KHR:
          pTimestamps[d] = device->ws->query_value(device->ws, RADEON_TIMESTAMP);
          uint64_t device_period = DIV_ROUND_UP(1000000, clock_crystal_freq);
          max_clock_period = MAX2(max_clock_period, device_period);
          break;
-      case VK_TIME_DOMAIN_CLOCK_MONOTONIC_EXT:
+      case VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR:
          pTimestamps[d] = vk_clock_gettime(CLOCK_MONOTONIC);
          max_clock_period = MAX2(max_clock_period, 1);
          break;
 
 #ifdef CLOCK_MONOTONIC_RAW
-      case VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_EXT:
+      case VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR:
          pTimestamps[d] = begin;
          break;
 #endif

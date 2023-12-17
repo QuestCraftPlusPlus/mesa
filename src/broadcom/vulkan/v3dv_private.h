@@ -138,7 +138,6 @@ struct v3dv_physical_device {
    char *name;
    int32_t render_fd;
    int32_t display_fd;
-   int32_t master_fd;
 
    /* We need these because it is not clear how to detect
     * valid devids in a portable way
@@ -201,13 +200,11 @@ struct v3dv_physical_device {
    } options;
 
    struct {
+      bool cpu_queue;
       bool multisync;
       bool perfmon;
    } caps;
 };
-
-VkResult v3dv_physical_device_acquire_display(struct v3dv_physical_device *pdevice,
-                                              VkIcdSurfaceBase *surface);
 
 static inline struct v3dv_bo *
 v3dv_device_lookup_bo(struct v3dv_physical_device *device, uint32_t handle)
@@ -253,6 +250,7 @@ enum v3dv_queue_type {
    V3DV_QUEUE_CL = 0,
    V3DV_QUEUE_CSD,
    V3DV_QUEUE_TFU,
+   V3DV_QUEUE_CPU,
    V3DV_QUEUE_ANY,
    V3DV_QUEUE_COUNT,
 };
@@ -618,10 +616,10 @@ struct v3dv_device_memory {
 
 #define V3DV_MAX_PLANE_COUNT 3
 struct v3dv_format_plane {
-   /* One of V3D33_OUTPUT_IMAGE_FORMAT_*, or OUTPUT_IMAGE_FORMAT_NO */
+   /* One of V3D42_OUTPUT_IMAGE_FORMAT_*, or OUTPUT_IMAGE_FORMAT_NO */
    uint8_t rt_type;
 
-   /* One of V3D33_TEXTURE_DATA_FORMAT_*. */
+   /* One of V3D42_TEXTURE_DATA_FORMAT_*. */
    uint8_t tex_type;
 
    /* Swizzle to apply to the RGBA shader output for storing to the tile
@@ -1091,6 +1089,7 @@ enum v3dv_cmd_dirty_bits {
    V3DV_CMD_DIRTY_VIEW_INDEX                = 1 << 17,
    V3DV_CMD_DIRTY_COLOR_WRITE_ENABLE        = 1 << 18,
    V3DV_CMD_DIRTY_DEPTH_BOUNDS              = 1 << 19,
+   V3DV_CMD_DIRTY_DRAW_ID                   = 1 << 20,
 };
 
 struct v3dv_dynamic_state {
@@ -1238,7 +1237,7 @@ struct v3dv_job {
 
    /* VK_KHR_buffer_device_address allows shaders to use pointers that can
     * dereference memory in any buffer that has been flagged with
-    * VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT_KHR. These buffers may not
+    * VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT. These buffers may not
     * be bound via descriptor sets, so we need to make sure that a job that
     * uses this functionality includes all these buffers in its kernel
     * submission.
@@ -1442,10 +1441,12 @@ enum {
    V3DV_BARRIER_GRAPHICS_BIT = (1 << 0),
    V3DV_BARRIER_COMPUTE_BIT  = (1 << 1),
    V3DV_BARRIER_TRANSFER_BIT = (1 << 2),
+   V3DV_BARRIER_CPU_BIT      = (1 << 3),
 };
 #define V3DV_BARRIER_ALL (V3DV_BARRIER_GRAPHICS_BIT | \
                           V3DV_BARRIER_TRANSFER_BIT | \
-                          V3DV_BARRIER_COMPUTE_BIT);
+                          V3DV_BARRIER_COMPUTE_BIT | \
+                          V3DV_BARRIER_CPU_BIT);
 
 struct v3dv_barrier_state {
    /* Mask of V3DV_BARRIER_* indicating where we consume a barrier. */
@@ -1529,6 +1530,9 @@ struct v3dv_cmd_buffer_state {
 
    /* Current view index for multiview rendering */
    uint32_t view_index;
+
+   /* Current draw ID for multidraw */
+   uint32_t draw_id;
 
    /* Used to flag OOM conditions during command buffer recording */
    bool oom;
@@ -1646,8 +1650,14 @@ struct v3dv_query {
          uint32_t offset;
       } occlusion;
 
-      /* Used by CPU queries (timestamp) */
-      uint64_t value;
+      /* Used by timestamp queries */
+      struct {
+         /* Offset of this query in the timestamp BO for its value */
+         uint32_t offset;
+
+         /* Syncobj to signal timestamp query availability */
+         struct vk_sync *sync;
+      } timestamp;
 
       /* Used by performance queries */
       struct v3dv_perf_query perf;
@@ -1679,6 +1689,12 @@ struct v3dv_query_pool {
       /* Offset of the availability info in the BO */
       uint32_t avail_offset;
    } occlusion;
+
+   /* Only used with timestamp queries */
+   struct {
+      /* BO with the query timestamp values */
+      struct v3dv_bo *bo;
+   } timestamp;
 
    /* Only used with performance queries */
    struct {
@@ -1846,7 +1862,7 @@ bool v3dv_cmd_buffer_check_needs_store(const struct v3dv_cmd_buffer_state *state
                                        VkAttachmentStoreOp store_op);
 
 void v3dv_cmd_buffer_emit_pipeline_barrier(struct v3dv_cmd_buffer *cmd_buffer,
-                                           const VkDependencyInfoKHR *info);
+                                           const VkDependencyInfo *info);
 
 bool v3dv_cmd_buffer_copy_image_tfu(struct v3dv_cmd_buffer *cmd_buffer,
                                     struct v3dv_image *dst,

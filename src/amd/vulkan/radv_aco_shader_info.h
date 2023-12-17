@@ -72,19 +72,17 @@ radv_aco_convert_shader_info(struct aco_shader_info *aco_info, const struct radv
    aco_info->next_stage_pc = radv_args->next_stage_pc;
 }
 
-#define ASSIGN_VS_STATE_FIELD(x)    aco_info->state.x = radv->state->x
-#define ASSIGN_VS_STATE_FIELD_CP(x) memcpy(&aco_info->state.x, &radv->state->x, sizeof(radv->state->x))
 static inline void
 radv_aco_convert_vs_prolog_key(struct aco_vs_prolog_info *aco_info, const struct radv_vs_prolog_key *radv,
                                const struct radv_shader_args *radv_args)
 {
-   ASSIGN_VS_STATE_FIELD(instance_rate_inputs);
-   ASSIGN_VS_STATE_FIELD(nontrivial_divisors);
-   ASSIGN_VS_STATE_FIELD(post_shuffle);
-   ASSIGN_VS_STATE_FIELD(alpha_adjust_lo);
-   ASSIGN_VS_STATE_FIELD(alpha_adjust_hi);
-   ASSIGN_VS_STATE_FIELD_CP(divisors);
-   ASSIGN_VS_STATE_FIELD_CP(formats);
+   ASSIGN_FIELD(instance_rate_inputs);
+   ASSIGN_FIELD(nontrivial_divisors);
+   ASSIGN_FIELD(zero_divisors);
+   ASSIGN_FIELD(post_shuffle);
+   ASSIGN_FIELD(alpha_adjust_lo);
+   ASSIGN_FIELD(alpha_adjust_hi);
+   ASSIGN_FIELD_CP(formats);
    ASSIGN_FIELD(num_attributes);
    ASSIGN_FIELD(misaligned_mask);
    ASSIGN_FIELD(is_ngg);
@@ -117,8 +115,12 @@ radv_aco_convert_ps_epilog_key(struct aco_ps_epilog_info *aco_info, const struct
    ASSIGN_FIELD(color_is_int8);
    ASSIGN_FIELD(color_is_int10);
    ASSIGN_FIELD(mrt0_is_dual_src);
+   ASSIGN_FIELD(alpha_to_coverage_via_mrtz);
 
-   memcpy(aco_info->colors, radv_args->ps_epilog_inputs, sizeof(aco_info->colors));
+   memcpy(aco_info->colors, radv_args->colors, sizeof(aco_info->colors));
+   aco_info->depth = radv_args->depth;
+   aco_info->stencil = radv_args->stencil;
+   aco_info->samplemask = radv_args->sample_mask;
 
    aco_info->alpha_func = COMPARE_FUNC_ALWAYS;
 }

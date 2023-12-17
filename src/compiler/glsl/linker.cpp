@@ -698,7 +698,7 @@ validate_geometry_shader_executable(struct gl_shader_program *prog,
       return;
 
    unsigned num_vertices =
-      vertices_per_prim(shader->Program->info.gs.input_primitive);
+      mesa_vertices_per_prim(shader->Program->info.gs.input_primitive);
    prog->Geom.VerticesIn = num_vertices;
 
    analyze_clip_cull_usage(prog, shader, consts, &shader->Program->info);
@@ -752,7 +752,7 @@ validate_geometry_shader_emissions(const struct gl_constants *consts,
        * stream.
        */
       if (prog->Geom.ActiveStreamMask & ~(1 << 0) &&
-          sh->Program->info.gs.output_primitive != GL_POINTS) {
+          sh->Program->info.gs.output_primitive != MESA_PRIM_POINTS) {
          linker_error(prog, "EmitStreamVertex(n) and EndStreamPrimitive(n) "
                       "with n>0 requires point output\n");
       }
@@ -2296,10 +2296,6 @@ link_intrastage_shaders(void *mem_ctx,
                         unsigned num_shaders,
                         bool allow_missing_main)
 {
-   struct gl_uniform_block *ubo_blocks = NULL;
-   struct gl_uniform_block *ssbo_blocks = NULL;
-   unsigned num_ubo_blocks = 0;
-   unsigned num_ssbo_blocks = 0;
    bool arb_fragment_coord_conventions_enable = false;
 
    /* Check that global variables defined in multiple shaders are consistent.
@@ -2466,49 +2462,10 @@ link_intrastage_shaders(void *mem_ctx,
    array_length_to_const_visitor len_v;
    len_v.run(linked->ir);
 
-   /* Link up uniform blocks defined within this stage. */
-   link_uniform_blocks(mem_ctx, &ctx->Const, prog, linked, &ubo_blocks,
-                       &num_ubo_blocks, &ssbo_blocks, &num_ssbo_blocks);
-
-   const unsigned max_uniform_blocks =
-      ctx->Const.Program[linked->Stage].MaxUniformBlocks;
-   if (num_ubo_blocks > max_uniform_blocks) {
-      linker_error(prog, "Too many %s uniform blocks (%d/%d)\n",
-                   _mesa_shader_stage_to_string(linked->Stage),
-                   num_ubo_blocks, max_uniform_blocks);
-   }
-
-   const unsigned max_shader_storage_blocks =
-      ctx->Const.Program[linked->Stage].MaxShaderStorageBlocks;
-   if (num_ssbo_blocks > max_shader_storage_blocks) {
-      linker_error(prog, "Too many %s shader storage blocks (%d/%d)\n",
-                   _mesa_shader_stage_to_string(linked->Stage),
-                   num_ssbo_blocks, max_shader_storage_blocks);
-   }
-
    if (!prog->data->LinkStatus) {
       _mesa_delete_linked_shader(ctx, linked);
       return NULL;
    }
-
-   /* Copy ubo blocks to linked shader list */
-   linked->Program->sh.UniformBlocks =
-      ralloc_array(linked, gl_uniform_block *, num_ubo_blocks);
-   ralloc_steal(linked, ubo_blocks);
-   for (unsigned i = 0; i < num_ubo_blocks; i++) {
-      linked->Program->sh.UniformBlocks[i] = &ubo_blocks[i];
-   }
-   linked->Program->sh.NumUniformBlocks = num_ubo_blocks;
-   linked->Program->info.num_ubos = num_ubo_blocks;
-
-   /* Copy ssbo blocks to linked shader list */
-   linked->Program->sh.ShaderStorageBlocks =
-      ralloc_array(linked, gl_uniform_block *, num_ssbo_blocks);
-   ralloc_steal(linked, ssbo_blocks);
-   for (unsigned i = 0; i < num_ssbo_blocks; i++) {
-      linked->Program->sh.ShaderStorageBlocks[i] = &ssbo_blocks[i];
-   }
-   linked->Program->info.num_ssbos = num_ssbo_blocks;
 
    /* At this point linked should contain all of the linked IR, so
     * validate it to make sure nothing went wrong.
@@ -2518,7 +2475,7 @@ link_intrastage_shaders(void *mem_ctx,
    /* Set the size of geometry shader input arrays */
    if (linked->Stage == MESA_SHADER_GEOMETRY) {
       unsigned num_vertices =
-         vertices_per_prim(gl_prog->info.gs.input_primitive);
+         mesa_vertices_per_prim(gl_prog->info.gs.input_primitive);
       array_resize_visitor input_resize_visitor(num_vertices, prog,
                                                 MESA_SHADER_GEOMETRY);
       foreach_in_list(ir_instruction, ir, linked->ir) {
@@ -3116,11 +3073,6 @@ link_shaders(struct gl_context *ctx, struct gl_shader_program *prog)
    if (!prog->data->LinkStatus)
       goto done;
 
-   for (unsigned int i = 0; i < MESA_SHADER_STAGES; i++) {
-      if (prog->_LinkedShaders[i] != NULL)
-         lower_named_interface_blocks(mem_ctx, prog->_LinkedShaders[i]);
-   }
-
    if (prog->IsES && prog->GLSL_Version == 100)
       if (!validate_invariant_builtins(prog,
             prog->_LinkedShaders[MESA_SHADER_VERTEX],
@@ -3152,24 +3104,27 @@ link_shaders(struct gl_context *ctx, struct gl_shader_program *prog)
       if (prog->_LinkedShaders[i] == NULL)
          continue;
 
-      detect_recursion_linked(prog, prog->_LinkedShaders[i]->ir);
+      struct gl_linked_shader *shader = prog->_LinkedShaders[i];
+      exec_list *ir = shader->ir;
+
+      detect_recursion_linked(prog, ir);
       if (!prog->data->LinkStatus)
          goto done;
 
-      if (consts->ShaderCompilerOptions[i].LowerCombinedClipCullDistance) {
-         lower_clip_cull_distance(prog, prog->_LinkedShaders[i]);
-      }
+      lower_vector_derefs(shader);
+
+      lower_packing_builtins(ir, ctx->Extensions.ARB_shading_language_packing,
+                             ctx->Extensions.ARB_gpu_shader5,
+                             ctx->Const.GLSLHasHalfFloatPacking);
+      do_mat_op_to_vec(ir);
+
+      lower_instructions(ir, ctx->Extensions.ARB_gpu_shader5);
+
+      do_vec_index_to_cond_assign(ir);
    }
 
    /* Check and validate stream emissions in geometry shaders */
    validate_geometry_shader_emissions(consts, prog);
-
-   for (unsigned i = 0; i < MESA_SHADER_STAGES; i++) {
-      if (prog->_LinkedShaders[i] == NULL)
-         continue;
-
-      lower_vector_derefs(prog->_LinkedShaders[i]);
-   }
 
 done:
    for (unsigned i = 0; i < MESA_SHADER_STAGES; i++) {
