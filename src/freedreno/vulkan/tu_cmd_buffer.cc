@@ -96,6 +96,7 @@ tu6_lazy_emit_tessfactor_addr(struct tu_cmd_buffer *cmd)
    cmd->state.tessfactor_addr_set = true;
 }
 
+template <chip CHIP>
 static void
 tu6_lazy_emit_vsc(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
 {
@@ -133,14 +134,24 @@ tu6_lazy_emit_vsc(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
 
    tu_get_scratch_bo(dev, size0 + num_vsc_pipes * 4, &vsc_bo);
 
-   tu_cs_emit_regs(cs,
-                   A6XX_VSC_DRAW_STRM_SIZE_ADDRESS(.bo = vsc_bo, .bo_offset = size0));
-   tu_cs_emit_regs(cs,
-                   A6XX_VSC_PRIM_STRM_ADDRESS(.bo = vsc_bo));
-   tu_cs_emit_regs(
-      cs, A6XX_VSC_DRAW_STRM_ADDRESS(.bo = vsc_bo,
-                                     .bo_offset = cmd->vsc_prim_strm_pitch *
-                                                  num_vsc_pipes));
+   if (CHIP == A6XX) {
+      tu_cs_emit_regs(cs,
+                     A6XX_VSC_DRAW_STRM_SIZE_ADDRESS(.bo = vsc_bo, .bo_offset = size0));
+      tu_cs_emit_regs(cs,
+                     A6XX_VSC_PRIM_STRM_ADDRESS(.bo = vsc_bo));
+      tu_cs_emit_regs(
+         cs, A6XX_VSC_DRAW_STRM_ADDRESS(.bo = vsc_bo,
+                                       .bo_offset = cmd->vsc_prim_strm_pitch *
+                                                   num_vsc_pipes));
+   } else {
+      tu_cs_emit_pkt7(cs, CP_SET_PSEUDO_REG, 3 * 3);
+      tu_cs_emit(cs, A6XX_CP_SET_PSEUDO_REG__0_PSEUDO_REG(DRAW_STRM_ADDRESS));
+      tu_cs_emit_qw(cs, vsc_bo->iova + cmd->vsc_prim_strm_pitch * num_vsc_pipes);
+      tu_cs_emit(cs, A6XX_CP_SET_PSEUDO_REG__0_PSEUDO_REG(DRAW_STRM_SIZE_ADDRESS));
+      tu_cs_emit_qw(cs, vsc_bo->iova + size0);
+      tu_cs_emit(cs, A6XX_CP_SET_PSEUDO_REG__0_PSEUDO_REG(PRIM_STRM_ADDRESS));
+      tu_cs_emit_qw(cs, vsc_bo->iova);
+   }
 
    cmd->vsc_initialized = true;
 }
@@ -218,30 +229,66 @@ tu_emit_cache_flush_renderpass(struct tu_cmd_buffer *cmd_buffer)
 TU_GENX(tu_emit_cache_flush_renderpass);
 
 template <chip CHIP>
-static struct fd_reg_pair
-rb_ccu_cntl(struct tu_device *dev, bool gmem)
+static void
+emit_rb_ccu_cntl(struct tu_cs *cs, struct tu_device *dev, bool gmem)
 {
-   if (CHIP == A7XX) {
-      return A6XX_RB_CCU_CNTL(.dword = gmem ? 0x68 : 0);
-   }
-
+   /* The CCUs are a cache that allocates memory from GMEM while facilitating
+    * framebuffer caching for sysmem rendering. The CCU is split into two parts,
+    * one for color and one for depth. The size and offset of these in GMEM can
+    * be configured separately.
+    *
+    * The most common configuration for the CCU is to occupy as much as possible
+    * of GMEM (CACHE_SIZE_FULL) during sysmem rendering as GMEM is unused. On
+    * the other hand, when rendering to GMEM, the CCUs can be left enabled at
+    * any configuration as they don't interfere with GMEM rendering and only
+    * overwrite GMEM when sysmem operations are performed.
+    *
+    * The vast majority of GMEM rendering doesn't need any sysmem operations
+    * but there are some cases where it is required. For example, when the
+    * framebuffer isn't aligned to the tile size or with certain MSAA resolves.
+    *
+    * To correctly handle these cases, we need to be able to switch between
+    * sysmem and GMEM rendering. We do this by allocating a carveout at the
+    * end of GMEM for the color CCU (as none of these operations are depth)
+    * which the color CCU offset is set to and the GMEM size available to the
+    * GMEM layout calculations is adjusted accordingly.
+    */
    uint32_t color_offset = gmem ? dev->physical_device->ccu_offset_gmem
                                 : dev->physical_device->ccu_offset_bypass;
 
    uint32_t color_offset_hi = color_offset >> 21;
    color_offset &= 0x1fffff;
-   enum a6xx_ccu_color_cache_size cache_size =
-      (a6xx_ccu_color_cache_size)(dev->physical_device->info->a6xx.gmem_ccu_color_cache_fraction);
+   enum a6xx_ccu_cache_size cache_size = !gmem ? CCU_CACHE_SIZE_FULL :
+      (a6xx_ccu_cache_size)(dev->physical_device->info->a6xx.gmem_ccu_color_cache_fraction);
    bool concurrent_resolve = dev->physical_device->info->a6xx.concurrent_resolve;
-   return  A6XX_RB_CCU_CNTL(.gmem_fast_clear_disable =
-         !dev->physical_device->info->a6xx.has_gmem_fast_clear,
-      .concurrent_resolve = concurrent_resolve,
-      .depth_offset_hi = 0,
-      .color_offset_hi = color_offset_hi,
-      .depth_cache_size = 0,
-      .depth_offset = 0,
-      .color_cache_size = cache_size,
-      .color_offset = color_offset);
+
+   if (CHIP == A7XX) {
+      tu_cs_emit_regs(cs, A7XX_RB_CCU_CNTL(
+         .gmem_fast_clear_disable =
+            !dev->physical_device->info->a6xx.has_gmem_fast_clear,
+         .concurrent_resolve = concurrent_resolve,
+      ));
+      tu_cs_emit_regs(cs, A7XX_RB_CCU_CNTL2(
+         .depth_offset_hi = 0,
+         .color_offset_hi = color_offset_hi,
+         .depth_cache_size = CCU_CACHE_SIZE_FULL,
+         .depth_offset = 0,
+         .color_cache_size = cache_size,
+         .color_offset = color_offset
+      ));
+   } else {
+      tu_cs_emit_regs(cs, A6XX_RB_CCU_CNTL(
+         .gmem_fast_clear_disable =
+            !dev->physical_device->info->a6xx.has_gmem_fast_clear,
+         .concurrent_resolve = concurrent_resolve,
+         .depth_offset_hi = 0,
+         .color_offset_hi = color_offset_hi,
+         .depth_cache_size = CCU_CACHE_SIZE_FULL,
+         .depth_offset = 0,
+         .color_cache_size = cache_size,
+         .color_offset = color_offset
+      ));
+   }
 }
 
 /* Cache flushes for things that use the color/depth read/write path (i.e.
@@ -285,8 +332,8 @@ tu_emit_cache_flush_ccu(struct tu_cmd_buffer *cmd_buffer,
    tu6_emit_flushes<CHIP>(cmd_buffer, cs, &cmd_buffer->state.cache);
 
    if (ccu_state != cmd_buffer->state.ccu_state) {
-      tu_cs_emit_regs(cs, rb_ccu_cntl<CHIP>(cmd_buffer->device,
-                                            ccu_state == TU_CMD_CCU_GMEM));
+      emit_rb_ccu_cntl<CHIP>(cs, cmd_buffer->device,
+                             ccu_state == TU_CMD_CCU_GMEM);
       cmd_buffer->state.ccu_state = ccu_state;
    }
 }
@@ -609,6 +656,9 @@ tu6_emit_window_offset(struct tu_cs *cs, uint32_t x1, uint32_t y1)
 
    tu_cs_emit_regs(cs,
                    A6XX_SP_TP_WINDOW_OFFSET(.x = x1, .y = y1));
+
+   tu_cs_emit_regs(cs,
+                   A7XX_SP_PS_2D_WINDOW_OFFSET(.x = x1, .y = y1));
 }
 
 void
@@ -806,10 +856,6 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
                      struct tu_renderpass_result **autotune_result)
 {
    if (TU_DEBUG(SYSMEM))
-      return true;
-
-   /* A7XX TODO: Add gmem support */
-   if (cmd->device->physical_device->info->chip >= 7)
       return true;
 
    /* can't fit attachments into gmem */
@@ -1158,7 +1204,7 @@ tu6_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
    cmd->state.cache.pending_flush_bits &=
       ~(TU_CMD_FLAG_WAIT_FOR_IDLE | TU_CMD_FLAG_CACHE_INVALIDATE);
 
-   tu_cs_emit_regs(cs, rb_ccu_cntl<CHIP>(cmd->device, false));
+   emit_rb_ccu_cntl<CHIP>(cs, cmd->device, false);
    cmd->state.ccu_state = TU_CMD_CCU_SYSMEM;
 
    for (size_t i = 0; i < ARRAY_SIZE(phys_dev->info->a6xx.magic_raw); i++) {
@@ -1392,11 +1438,13 @@ tu6_emit_binning_pass(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
 
    update_vsc_pipe(cmd, cs, phys_dev->info->num_vsc_pipes);
 
-   tu_cs_emit_regs(cs,
-                   A6XX_PC_POWER_CNTL(phys_dev->info->a6xx.magic.PC_POWER_CNTL));
+   if (CHIP == A6XX) {
+      tu_cs_emit_regs(cs,
+                     A6XX_PC_POWER_CNTL(phys_dev->info->a6xx.magic.PC_POWER_CNTL));
 
-   tu_cs_emit_regs(cs,
-                   A6XX_VFD_POWER_CNTL(phys_dev->info->a6xx.magic.PC_POWER_CNTL));
+      tu_cs_emit_regs(cs,
+                     A6XX_VFD_POWER_CNTL(phys_dev->info->a6xx.magic.PC_POWER_CNTL));
+   }
 
    tu_cs_emit_pkt7(cs, CP_EVENT_WRITE, 1);
    tu_cs_emit(cs, UNK_2C);
@@ -1646,11 +1694,12 @@ tu6_sysmem_render_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       .lrz_feedback_zmode_mask = 0x0,
    });
 
-   if (CHIP == A7XX) {
+   if (CHIP >= A7XX) {
+      tu_cs_emit_pkt7(cs, CP_THREAD_CONTROL, 1);
+      tu_cs_emit(cs, CP_THREAD_CONTROL_0_THREAD(CP_SET_THREAD_BR));
+
       tu_cs_emit_regs(cs,
                      A7XX_RB_UNKNOWN_8812(0x3ff)); // all buffers in sysmem
-      tu_cs_emit_regs(cs,
-                   A7XX_RB_UNKNOWN_88E5(0x50120004));
       tu_cs_emit_regs(cs,
                    A7XX_RB_UNKNOWN_8E06(0x2080000));
 
@@ -1661,14 +1710,13 @@ tu6_sysmem_render_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
 
       tu_cs_emit_regs(cs, A6XX_GRAS_UNKNOWN_8110(0x2));
       tu_cs_emit_regs(cs, A7XX_RB_UNKNOWN_8E09(0x4));
+   } else {
+      tu_cs_emit_pkt7(cs, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
+      tu_cs_emit(cs, 0x0);
    }
 
    tu_cs_emit_pkt7(cs, CP_SET_MARKER, 1);
    tu_cs_emit(cs, A6XX_CP_SET_MARKER_0_MODE(RM6_BYPASS));
-
-   /* A7XX TODO: blob doesn't use CP_SKIP_IB2_ENABLE_* */
-   tu_cs_emit_pkt7(cs, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
-   tu_cs_emit(cs, 0x0);
 
    tu_emit_cache_flush_ccu<CHIP>(cmd, cs, TU_CMD_CCU_SYSMEM);
 
@@ -1678,7 +1726,7 @@ tu6_sysmem_render_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    tu_cs_emit_pkt7(cs, CP_SET_MODE, 1);
    tu_cs_emit(cs, 0x0);
 
-   tu_autotune_begin_renderpass(cmd, cs, autotune_result);
+   tu_autotune_begin_renderpass<CHIP>(cmd, cs, autotune_result);
 
    tu_cs_sanity_check(cs);
 }
@@ -1688,7 +1736,7 @@ static void
 tu6_sysmem_render_end(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                       struct tu_renderpass_result *autotune_result)
 {
-   tu_autotune_end_renderpass(cmd, cs, autotune_result);
+   tu_autotune_end_renderpass<CHIP>(cmd, cs, autotune_result);
 
    /* Do any resolves of the last subpass. These are handled in the
     * tile_store_cs in the gmem path.
@@ -1714,14 +1762,35 @@ tu6_tile_render_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    const struct tu_tiling_config *tiling = cmd->state.tiling;
    tu_lrz_tiling_begin(cmd, cs);
 
-   tu_cs_emit_pkt7(cs, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
-   tu_cs_emit(cs, 0x0);
+   if (CHIP >= A7XX) {
+      tu_cs_emit_pkt7(cs, CP_THREAD_CONTROL, 1);
+      tu_cs_emit(cs, CP_THREAD_CONTROL_0_THREAD(CP_SET_THREAD_BR) |
+                     CP_THREAD_CONTROL_0_CONCURRENT_BIN_DISABLE);
+
+      tu_cs_emit_regs(cs,
+                     A7XX_RB_UNKNOWN_8812(0x0));
+      tu_cs_emit_regs(cs,
+                   A7XX_RB_UNKNOWN_8E06(0x0));
+
+      tu_cs_emit_regs(cs, A7XX_GRAS_UNKNOWN_8007(0x0));
+      tu_cs_emit_regs(cs, A7XX_GRAS_UNKNOWN_810B(0x0));
+      tu_cs_emit_regs(cs, A7XX_GRAS_UNKNOWN_8113(0x0));
+
+      tu_cs_emit_regs(cs, A6XX_GRAS_UNKNOWN_8110(0x2));
+      tu_cs_emit_regs(cs, A7XX_RB_UNKNOWN_8E09(0x4));
+
+      tu_cs_emit_pkt7(cs, CP_DRAW_PRED_ENABLE_LOCAL, 1);
+      tu_cs_emit(cs, 0x0);
+   } else {
+      tu_cs_emit_pkt7(cs, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
+      tu_cs_emit(cs, 0x0);
+   }
 
    tu_emit_cache_flush_ccu<CHIP>(cmd, cs, TU_CMD_CCU_GMEM);
 
    if (use_hw_binning(cmd)) {
       if (!cmd->vsc_initialized) {
-         tu6_lazy_emit_vsc(cmd, cs);
+         tu6_lazy_emit_vsc<CHIP>(cmd, cs);
       }
 
       tu6_emit_bin_size<CHIP>(cs, tiling->tile0.width, tiling->tile0.height,
@@ -1746,16 +1815,23 @@ tu6_tile_render_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       tu_cs_emit_regs(cs,
                       A6XX_VFD_MODE_CNTL(RENDERING_PASS));
 
-      tu_cs_emit_regs(cs,
-                      A6XX_PC_POWER_CNTL(phys_dev->info->a6xx.magic.PC_POWER_CNTL));
+      if (CHIP == A6XX) {
+         tu_cs_emit_regs(cs,
+                        A6XX_PC_POWER_CNTL(phys_dev->info->a6xx.magic.PC_POWER_CNTL));
 
-      tu_cs_emit_regs(cs,
-                      A6XX_VFD_POWER_CNTL(phys_dev->info->a6xx.magic.PC_POWER_CNTL));
+         tu_cs_emit_regs(cs,
+                        A6XX_VFD_POWER_CNTL(phys_dev->info->a6xx.magic.PC_POWER_CNTL));
+      }
 
-      tu_cs_emit_pkt7(cs, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
-      tu_cs_emit(cs, 0x1);
-      tu_cs_emit_pkt7(cs, CP_SKIP_IB2_ENABLE_LOCAL, 1);
-      tu_cs_emit(cs, 0x1);
+      if (CHIP >= A7XX) {
+         tu_cs_emit_pkt7(cs, CP_DRAW_PRED_ENABLE_LOCAL, 1);
+         tu_cs_emit(cs, 0x1);
+      } else {
+         tu_cs_emit_pkt7(cs, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
+         tu_cs_emit(cs, 0x1);
+         tu_cs_emit_pkt7(cs, CP_SKIP_IB2_ENABLE_LOCAL, 1);
+         tu_cs_emit(cs, 0x1);
+      }
    } else {
       tu6_emit_bin_size<CHIP>(cs, tiling->tile0.width, tiling->tile0.height,
                               {
@@ -1775,7 +1851,7 @@ tu6_tile_render_begin(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
       }
    }
 
-   tu_autotune_begin_renderpass(cmd, cs, autotune_result);
+   tu_autotune_begin_renderpass<CHIP>(cmd, cs, autotune_result);
 
    tu_cs_sanity_check(cs);
 }
@@ -1810,8 +1886,13 @@ tu6_render_tile(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
    if (cmd->state.rp.draw_cs_writes_to_cond_pred)
       tu6_emit_cond_for_load_stores(cmd, cs, pipe, slot, false);
 
-   tu_cs_emit_pkt7(cs, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
-   tu_cs_emit(cs, 0x0);
+   if (CHIP >= A7XX) {
+      tu_cs_emit_pkt7(cs, CP_DRAW_PRED_ENABLE_LOCAL, 1);
+      tu_cs_emit(cs, 0x0);
+   } else {
+      tu_cs_emit_pkt7(cs, CP_SKIP_IB2_ENABLE_GLOBAL, 1);
+      tu_cs_emit(cs, 0x0);
+   }
 
    tu_cs_emit_call(cs, &cmd->tile_store_cs);
 
@@ -1828,7 +1909,7 @@ static void
 tu6_tile_render_end(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                     struct tu_renderpass_result *autotune_result)
 {
-   tu_autotune_end_renderpass(cmd, cs, autotune_result);
+   tu_autotune_end_renderpass<CHIP>(cmd, cs, autotune_result);
 
    tu_cs_emit_call(cs, &cmd->draw_epilogue_cs);
 
