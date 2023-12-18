@@ -1450,6 +1450,7 @@ r3d_setup(struct tu_cmd_buffer *cmd,
 
       if (CHIP >= A7XX) {
          tu_cs_emit_regs(cs, A7XX_RB_UNKNOWN_8812(0x3ff));
+         tu_cs_emit_regs(cs, A7XX_RB_UNKNOWN_88E5(0x50120004));
          tu_cs_emit_regs(cs, A7XX_RB_UNKNOWN_8E06(0x2080000));
       }
    }
@@ -3079,10 +3080,6 @@ clear_gmem_attachment(struct tu_cmd_buffer *cmd,
    tu_cs_emit_pkt4(cs, REG_A6XX_RB_BLIT_CLEAR_COLOR_DW0, 4);
    tu_cs_emit_array(cs, clear_vals, 4);
 
-   if (CHIP >= A7XX) {
-      tu_cs_emit_regs(cs, A7XX_RB_UNKNOWN_88E4(.unk0 = 1));
-   }
-
    tu_emit_event_write<CHIP>(cmd, cs, FD_BLIT);
 }
 
@@ -3403,10 +3400,6 @@ tu_emit_blit(struct tu_cmd_buffer *cmd,
       tu_cs_emit_pkt4(cs, REG_A6XX_RB_UNKNOWN_88D0, 1);
       tu_cs_emit(cs, 0);
 
-      if (CHIP >= A7XX) {
-         tu_cs_emit_regs(cs, A7XX_RB_UNKNOWN_88E4(.unk0 = 1));
-      }
-
       tu_emit_event_write<CHIP>(cmd, cs, FD_BLIT);
    }
 }
@@ -3427,7 +3420,7 @@ blit_can_resolve(VkFormat format)
     * note: this includes all float formats
     * note2: single channel integer formats seem OK
     */
-   if (desc->channel[0].size > 10 && vk_format_is_color(format))
+   if (desc->channel[0].size > 10)
       return false;
 
    switch (format) {
@@ -3438,6 +3431,8 @@ blit_can_resolve(VkFormat format)
    case VK_FORMAT_R8G8_UINT:
    case VK_FORMAT_R8G8_SINT:
    case VK_FORMAT_R8G8_SRGB:
+   /* TODO: this one should be able to work? */
+   case VK_FORMAT_D24_UNORM_S8_UINT:
       return false;
    default:
       break;
@@ -3699,7 +3694,7 @@ store_cp_blit(struct tu_cmd_buffer *cmd,
     * sysmem, and we generally assume that GMEM renderpasses leave their
     * results in sysmem, so we need to flush manually here.
     */
-   tu_emit_event_write<CHIP>(cmd, cs, CHIP > A6XX ? FD_CCU_FLUSH_BLIT_CACHE : FD_CCU_FLUSH_COLOR);
+   tu_emit_event_write<CHIP>(cmd, cs, FD_CCU_FLUSH_COLOR);
 }
 
 template <chip CHIP>
@@ -3979,7 +3974,6 @@ tu_store_gmem_attachment(struct tu_cmd_buffer *cmd,
          }
       }
    } else {
-      /* A7XX TODO: Fix D24S8 MSAA resolves using the 2D blits */
       if (!cmd->state.pass->has_fdm) {
          r2d_coords(cs, render_area->offset, render_area->offset,
                     render_area->extent);
