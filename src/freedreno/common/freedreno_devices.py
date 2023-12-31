@@ -852,7 +852,7 @@ add_gpus([
             # corruption in some tests.
             PC_MODE_CNTL = 0x0000003f,
             SP_DBG_ECO_CNTL = 0x10000000,
-            RB_DBG_ECO_CNTL = 0x00000000,
+            RB_DBG_ECO_CNTL = 0x1,
             RB_DBG_ECO_CNTL_blit = 0x00000000,  # is it even needed?
             # HLSQ_DBG_ECO_CNTL = 0x0,
             RB_UNKNOWN_8E01 = 0x0,
