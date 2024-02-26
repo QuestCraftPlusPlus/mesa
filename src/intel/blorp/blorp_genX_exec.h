@@ -729,9 +729,10 @@ blorp_emit_vs_config(struct blorp_batch *batch,
          vs.MaximumNumberofThreads =
             batch->blorp->isl_dev->info->max_vs_threads - 1;
 
-#if GFX_VER >= 8
-         vs.SIMD8DispatchEnable =
-            vs_prog_data->base.dispatch_mode == DISPATCH_MODE_SIMD8;
+         assert(GFX_VER < 8 ||
+                vs_prog_data->base.dispatch_mode == DISPATCH_MODE_SIMD8);
+#if GFX_VER >= 8 && GFX_VER < 20
+         vs.SIMD8DispatchEnable = true;
 #endif
       }
    }
@@ -947,22 +948,28 @@ blorp_emit_ps_config(struct blorp_batch *batch,
             brw_wm_prog_data_dispatch_grf_start_reg(prog_data, ps, 0);
          ps.DispatchGRFStartRegisterForConstantSetupData1 =
             brw_wm_prog_data_dispatch_grf_start_reg(prog_data, ps, 1);
+#if GFX_VER < 20
          ps.DispatchGRFStartRegisterForConstantSetupData2 =
             brw_wm_prog_data_dispatch_grf_start_reg(prog_data, ps, 2);
+#endif
 
          ps.KernelStartPointer0 = params->wm_prog_kernel +
                                   brw_wm_prog_data_prog_offset(prog_data, ps, 0);
          ps.KernelStartPointer1 = params->wm_prog_kernel +
                                   brw_wm_prog_data_prog_offset(prog_data, ps, 1);
+#if GFX_VER < 20
          ps.KernelStartPointer2 = params->wm_prog_kernel +
                                   brw_wm_prog_data_prog_offset(prog_data, ps, 2);
+#endif
       }
    }
 
    blorp_emit(batch, GENX(3DSTATE_PS_EXTRA), psx) {
       if (prog_data) {
          psx.PixelShaderValid = true;
+#if GFX_VER < 20
          psx.AttributeEnable = prog_data->num_varying_inputs > 0;
+#endif
          psx.PixelShaderIsPerSample = prog_data->persample_dispatch;
          psx.PixelShaderComputedDepthMode = prog_data->computed_depth_mode;
 #if GFX_VER >= 9
@@ -1851,6 +1858,9 @@ blorp_emit_gfx8_hiz_op(struct blorp_batch *batch,
          hzp.DepthBufferClearEnable = params->depth.enabled;
          hzp.StencilClearValue = params->stencil_ref;
          hzp.FullSurfaceDepthandStencilClear = params->full_surface_hiz_op;
+#if GFX_VER >= 20
+         hzp.DepthClearValue = params->depth.clear_color.f32[0];
+#endif
          break;
       case ISL_AUX_OP_FULL_RESOLVE:
          assert(params->full_surface_hiz_op);
@@ -2181,6 +2191,14 @@ blorp_exec_compute(struct blorp_batch *batch, const struct blorp_params *params)
       cw.IndirectDataStartAddress       = push_const_offset;
       cw.IndirectDataLength             = push_const_size;
 
+#if GFX_VERx10 >= 125
+      cw.GenerateLocalID                = cs_prog_data->generate_local_id != 0;
+      cw.EmitLocal                      = cs_prog_data->generate_local_id;
+      cw.WalkOrder                      = cs_prog_data->walk_order;
+      cw.TileLayout = cs_prog_data->walk_order == BRW_WALK_ORDER_YXZ ?
+                      TileY32bpe : Linear;
+#endif
+
       cw.InterfaceDescriptor = (struct GENX(INTERFACE_DESCRIPTOR_DATA)) {
          .KernelStartPointer = params->cs_prog_kernel,
          .SamplerStatePointer = samplers_offset,
@@ -2325,6 +2343,7 @@ xy_bcb_tiling(const struct isl_surf *surf)
    case ISL_TILING_4:
       return XY_TILE_4;
    case ISL_TILING_64:
+   case ISL_TILING_64_XE2:
       return XY_TILE_64;
 #else
    case ISL_TILING_Y0:

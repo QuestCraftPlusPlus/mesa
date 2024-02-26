@@ -422,6 +422,10 @@
    DRI_CONF_OPT_B(vk_x11_ensure_min_image_count, def, \
                   "Force the X11 WSI to create at least the number of image specified by the driver in VkSurfaceCapabilitiesKHR::minImageCount")
 
+#define DRI_CONF_VK_X11_IGNORE_SUBOPTIMAL(def) \
+   DRI_CONF_OPT_B(vk_x11_ignore_suboptimal, def, \
+                  "Force the X11 WSI to never report VK_SUBOPTIMAL_KHR")
+
 #define DRI_CONF_VK_KHR_PRESENT_WAIT(def) \
    DRI_CONF_OPT_B(vk_khr_present_wait, def, \
                   "Expose VK_KHR_present_wait and id extensions despite them not being implemented for all supported surface types")
@@ -712,6 +716,13 @@
                   "Override the shader version of ray tracing pipelines to force re-compilation. (0 = default)")
 
 #define DRI_CONF_RADV_APP_LAYER() DRI_CONF_OPT_S_NODEF(radv_app_layer, "Select an application layer.")
+
+#define DRI_CONF_RADV_CLEAR_LDS(def) \
+   DRI_CONF_OPT_B(radv_clear_lds, def, "Clear LDS at the end of shaders. Might decrease performance.")
+
+#define DRI_CONF_RADV_FORCE_ACTIVE_ACCEL_STRUCT_LEAVES(def) \
+   DRI_CONF_OPT_B(radv_force_active_accel_struct_leaves, def, \
+                  "Force leaf nodes of acceleration structures to be marked active.")
 
 /**
  * \brief ANV specific configuration options

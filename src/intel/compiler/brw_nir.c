@@ -709,8 +709,8 @@ brw_nir_optimize(nir_shader *nir, bool is_scalar,
       }
 
       OPT(nir_opt_dead_cf);
-      if (OPT(nir_opt_trivial_continues)) {
-         /* If nir_opt_trivial_continues makes progress, then we need to clean
+      if (OPT(nir_opt_loop)) {
+         /* If nir_opt_loop makes progress, then we need to clean
           * things up if we want any hope of nir_opt_if or nir_opt_loop_unroll
           * to make progress.
           */
@@ -945,6 +945,7 @@ brw_preprocess_nir(const struct brw_compiler *compiler, nir_shader *nir,
       .lower_offset_filter =
          devinfo->verx10 >= 125 ? lower_xehp_tg4_offset_filter : NULL,
       .lower_invalid_implicit_lod = true,
+      .pack_lod_and_array_index = devinfo->ver >= 20,
    };
 
    /* In the case where TG4 coords are lowered to offsets and we have a
@@ -1001,6 +1002,7 @@ brw_preprocess_nir(const struct brw_compiler *compiler, nir_shader *nir,
       .lower_quad_broadcast_dynamic = true,
       .lower_elect = true,
       .lower_inverse_ballot = true,
+      .lower_rotate_to_shuffle = true,
    };
    OPT(nir_lower_subgroups, &subgroups_options);
 
@@ -1757,14 +1759,6 @@ brw_postprocess_nir(nir_shader *nir, const struct brw_compiler *compiler,
    if (OPT(nir_opt_rematerialize_compares))
       OPT(nir_opt_dce);
 
-   /* This is the last pass we run before we start emitting stuff.  It
-    * determines when we need to insert boolean resolves on Gen <= 5.  We
-    * run it last because it stashes data in instr->pass_flags and we don't
-    * want that to be squashed by other NIR passes.
-    */
-   if (devinfo->ver <= 5)
-      brw_nir_analyze_boolean_resolves(nir);
-
    OPT(nir_opt_dce);
 
    /* The mesh stages require this pass to be called at the last minute,
@@ -1777,6 +1771,15 @@ brw_postprocess_nir(nir_shader *nir, const struct brw_compiler *compiler,
       brw_nir_adjust_payload(nir);
 
    nir_trivialize_registers(nir);
+
+   /* This is the last pass we run before we start emitting stuff.  It
+    * determines when we need to insert boolean resolves on Gen <= 5.  We
+    * run it last because it stashes data in instr->pass_flags and we don't
+    * want that to be squashed by other NIR passes.
+    */
+   if (devinfo->ver <= 5)
+      brw_nir_analyze_boolean_resolves(nir);
+
    nir_sweep(nir);
 
    if (unlikely(debug_enabled)) {

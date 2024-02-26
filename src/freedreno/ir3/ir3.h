@@ -335,7 +335,14 @@ typedef enum ir3_instruction_flags {
     * before register assignment is done:
     */
    IR3_INSTR_MARK = BIT(15),
-   IR3_INSTR_UNUSED = BIT(16),
+
+   /* Used by shared register allocation when creating spill/reload instructions
+    * to inform validation that this is created by RA. This also may be set on
+    * an instruction where a spill has been folded into it.
+    */
+   IR3_INSTR_SHARED_SPILL = IR3_INSTR_MARK,
+
+   IR3_INSTR_UNUSED = BIT(17),
 } ir3_instruction_flags;
 
 struct ir3_instruction {
@@ -646,12 +653,14 @@ struct ir3_block {
     */
    struct ir3_instruction *condition;
    struct ir3_block *successors[2];
-   struct ir3_block *physical_successors[2];
 
    DECLARE_ARRAY(struct ir3_block *, predecessors);
    DECLARE_ARRAY(struct ir3_block *, physical_predecessors);
+   DECLARE_ARRAY(struct ir3_block *, physical_successors);
 
    uint16_t start_ip, end_ip;
+
+   bool reconvergence_point;
 
    /* Track instructions which do not write a register but other-
     * wise must not be discarded (such as kill, stg, etc)
@@ -715,12 +724,9 @@ ir3_after_preamble(struct ir3 *ir)
 }
 
 void ir3_block_add_predecessor(struct ir3_block *block, struct ir3_block *pred);
-void ir3_block_add_physical_predecessor(struct ir3_block *block,
-                                        struct ir3_block *pred);
+void ir3_block_link_physical(struct ir3_block *pred, struct ir3_block *succ);
 void ir3_block_remove_predecessor(struct ir3_block *block,
                                   struct ir3_block *pred);
-void ir3_block_remove_physical_predecessor(struct ir3_block *block,
-                                           struct ir3_block *pred);
 unsigned ir3_block_get_pred_index(struct ir3_block *block,
                                   struct ir3_block *pred);
 
@@ -1920,9 +1926,11 @@ soft_sy_delay(struct ir3_instruction *instr, struct ir3 *shader)
    }
 }
 
-
 /* unreachable block elimination: */
 bool ir3_remove_unreachable(struct ir3 *ir);
+
+/* calculate reconvergence information: */
+void ir3_calc_reconvergence(struct ir3_shader_variant *so);
 
 /* dead code elimination: */
 struct ir3_shader_variant;

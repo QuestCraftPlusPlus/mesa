@@ -37,6 +37,7 @@
 #include "radv_private.h"
 #include "sid.h"
 #include "vk_acceleration_structure.h"
+#include "vk_common_entrypoints.h"
 
 #define TIMESTAMP_NOT_READY UINT64_MAX
 
@@ -1167,8 +1168,8 @@ radv_query_shader(struct radv_cmd_buffer *cmd_buffer, VkPipeline *pipeline, stru
       uint32_t uses_gds;
    } push_constants = {flags, dst_stride, pipeline_stats_mask, avail_offset, uses_gds};
 
-   radv_CmdPushConstants(radv_cmd_buffer_to_handle(cmd_buffer), device->meta_state.query.p_layout,
-                         VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_constants), &push_constants);
+   vk_common_CmdPushConstants(radv_cmd_buffer_to_handle(cmd_buffer), device->meta_state.query.p_layout,
+                              VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_constants), &push_constants);
 
    cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_INV_L2 | RADV_CMD_FLAG_INV_VCACHE;
 
@@ -1331,6 +1332,27 @@ radv_DestroyQueryPool(VkDevice _device, VkQueryPool _pool, const VkAllocationCal
    radv_destroy_query_pool(device, pAllocator, pool);
 }
 
+static inline uint64_t
+radv_get_rel_timeout_for_query(VkQueryType type)
+{
+   /*
+    * Certain queries are only possible on certain types of queues
+    * so pick the TDR timeout of the highest possible type
+    * and double it to ensure GetQueryPoolResults completes in finite-time.
+    *
+    * (compute has longer TDR than gfx, other rings)
+    */
+   switch (type) {
+   case VK_QUERY_TYPE_OCCLUSION:
+   case VK_QUERY_TYPE_PRIMITIVES_GENERATED_EXT:
+   case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
+   case VK_QUERY_TYPE_MESH_PRIMITIVES_GENERATED_EXT:
+      return radv_get_tdr_timeout_for_ip(AMD_IP_GFX) * 2;
+   default:
+      return radv_get_tdr_timeout_for_ip(AMD_IP_COMPUTE) * 2;
+   }
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 radv_GetQueryPoolResults(VkDevice _device, VkQueryPool queryPool, uint32_t firstQuery, uint32_t queryCount,
                          size_t dataSize, void *pData, VkDeviceSize stride, VkQueryResultFlags flags)
@@ -1348,6 +1370,8 @@ radv_GetQueryPoolResults(VkDevice _device, VkQueryPool queryPool, uint32_t first
       unsigned query = firstQuery + query_idx;
       char *src = pool->ptr + query * pool->stride;
       uint32_t available;
+      bool timed_out = false;
+      uint64_t atimeout = os_time_get_absolute_timeout(radv_get_rel_timeout_for_query(pool->vk.query_type));
 
       switch (pool->vk.query_type) {
       case VK_QUERY_TYPE_TIMESTAMP:
@@ -1360,11 +1384,14 @@ radv_GetQueryPoolResults(VkDevice _device, VkQueryPool queryPool, uint32_t first
 
          do {
             value = p_atomic_read(&src64->value);
-         } while (value == TIMESTAMP_NOT_READY && (flags & VK_QUERY_RESULT_WAIT_BIT));
+         } while (value == TIMESTAMP_NOT_READY && (flags & VK_QUERY_RESULT_WAIT_BIT) &&
+                  !(timed_out = (atimeout < os_time_get_nano())));
 
          available = value != TIMESTAMP_NOT_READY;
 
-         if (!available && !(flags & VK_QUERY_RESULT_PARTIAL_BIT))
+         if (timed_out)
+            result = VK_ERROR_DEVICE_LOST;
+         else if (!available && !(flags & VK_QUERY_RESULT_PARTIAL_BIT))
             result = VK_NOT_READY;
 
          if (flags & VK_QUERY_RESULT_64_BIT) {
@@ -1394,7 +1421,8 @@ radv_GetQueryPoolResults(VkDevice _device, VkQueryPool queryPool, uint32_t first
             do {
                start = p_atomic_read(&src64[2 * i].value);
                end = p_atomic_read(&src64[2 * i + 1].value);
-            } while ((!(start & (1ull << 63)) || !(end & (1ull << 63))) && (flags & VK_QUERY_RESULT_WAIT_BIT));
+            } while ((!(start & (1ull << 63)) || !(end & (1ull << 63))) && (flags & VK_QUERY_RESULT_WAIT_BIT) &&
+                     !(timed_out = (atimeout < os_time_get_nano())));
 
             if (!(start & (1ull << 63)) || !(end & (1ull << 63)))
                available = 0;
@@ -1403,7 +1431,9 @@ radv_GetQueryPoolResults(VkDevice _device, VkQueryPool queryPool, uint32_t first
             }
          }
 
-         if (!available && !(flags & VK_QUERY_RESULT_PARTIAL_BIT))
+         if (timed_out)
+            result = VK_ERROR_DEVICE_LOST;
+         else if (!available && !(flags & VK_QUERY_RESULT_PARTIAL_BIT))
             result = VK_NOT_READY;
 
          if (flags & VK_QUERY_RESULT_64_BIT) {
@@ -1434,9 +1464,11 @@ radv_GetQueryPoolResults(VkDevice _device, VkQueryPool queryPool, uint32_t first
                if (!(p_atomic_read(avail_ptr_start) & 0x80000000) || !(p_atomic_read(avail_ptr_stop) & 0x80000000))
                   available = 0;
             }
-         } while (!available && (flags & VK_QUERY_RESULT_WAIT_BIT));
+         } while (!available && (flags & VK_QUERY_RESULT_WAIT_BIT) && !(timed_out = (atimeout < os_time_get_nano())));
 
-         if (!available && !(flags & VK_QUERY_RESULT_PARTIAL_BIT))
+         if (timed_out)
+            result = VK_ERROR_DEVICE_LOST;
+         else if (!available && !(flags & VK_QUERY_RESULT_PARTIAL_BIT))
             result = VK_NOT_READY;
 
          const uint64_t *start = (uint64_t *)src;
@@ -1484,9 +1516,11 @@ radv_GetQueryPoolResults(VkDevice _device, VkQueryPool queryPool, uint32_t first
                if (!(p_atomic_read(&src64[j].value) & 0x8000000000000000UL))
                   available = 0;
             }
-         } while (!available && (flags & VK_QUERY_RESULT_WAIT_BIT));
+         } while (!available && (flags & VK_QUERY_RESULT_WAIT_BIT) && !(timed_out = (atimeout < os_time_get_nano())));
 
-         if (!available && !(flags & VK_QUERY_RESULT_PARTIAL_BIT))
+         if (timed_out)
+            result = VK_ERROR_DEVICE_LOST;
+         else if (!available && !(flags & VK_QUERY_RESULT_PARTIAL_BIT))
             result = VK_NOT_READY;
 
          num_primitives_written = p_atomic_read_relaxed(&src64[3].value) - p_atomic_read_relaxed(&src64[1].value);
@@ -1530,9 +1564,11 @@ radv_GetQueryPoolResults(VkDevice _device, VkQueryPool queryPool, uint32_t first
                                    !(p_atomic_read(&src64[5].value) & 0x8000000000000000UL))) {
                available = 0;
             }
-         } while (!available && (flags & VK_QUERY_RESULT_WAIT_BIT));
+         } while (!available && (flags & VK_QUERY_RESULT_WAIT_BIT) && !(timed_out = (atimeout < os_time_get_nano())));
 
-         if (!available && !(flags & VK_QUERY_RESULT_PARTIAL_BIT))
+         if (timed_out)
+            result = VK_ERROR_DEVICE_LOST;
+         else if (!available && !(flags & VK_QUERY_RESULT_PARTIAL_BIT))
             result = VK_NOT_READY;
 
          primitive_storage_needed = p_atomic_read_relaxed(&src64[2].value) - p_atomic_read_relaxed(&src64[0].value);
@@ -1562,7 +1598,7 @@ radv_GetQueryPoolResults(VkDevice _device, VkQueryPool queryPool, uint32_t first
             for (unsigned i = 0; i < pc_pool->num_passes; ++i)
                if (!p_atomic_read(&src64[pool->stride / 8 - i - 1].value))
                   avail = false;
-         } while (!avail && (flags & VK_QUERY_RESULT_WAIT_BIT));
+         } while (!avail && (flags & VK_QUERY_RESULT_WAIT_BIT) && !(timed_out = (atimeout < os_time_get_nano())));
 
          available = avail;
 
@@ -1580,9 +1616,11 @@ radv_GetQueryPoolResults(VkDevice _device, VkQueryPool queryPool, uint32_t first
                 !(p_atomic_read(&src64[1].value) & 0x8000000000000000UL)) {
                available = 0;
             }
-         } while (!available && (flags & VK_QUERY_RESULT_WAIT_BIT));
+         } while (!available && (flags & VK_QUERY_RESULT_WAIT_BIT) && !(timed_out = (atimeout < os_time_get_nano())));
 
-         if (!available && !(flags & VK_QUERY_RESULT_PARTIAL_BIT))
+         if (timed_out)
+            result = VK_ERROR_DEVICE_LOST;
+         else if (!available && !(flags & VK_QUERY_RESULT_PARTIAL_BIT))
             result = VK_NOT_READY;
 
          ms_prim_gen = p_atomic_read_relaxed(&src64[1].value) - p_atomic_read_relaxed(&src64[0].value);
@@ -1611,6 +1649,9 @@ radv_GetQueryPoolResults(VkDevice _device, VkQueryPool queryPool, uint32_t first
       }
    }
 
+   if (result == VK_ERROR_DEVICE_LOST)
+      vk_device_set_lost(&device->vk, "GetQueryPoolResults timed out");
+
    return result;
 }
 
@@ -1624,7 +1665,7 @@ emit_query_flush(struct radv_cmd_buffer *cmd_buffer, struct radv_query_pool *poo
           * path. Small pools don't need any cache flushes
           * because we use a CP dma clear.
           */
-         si_emit_cache_flush(cmd_buffer);
+         radv_emit_cache_flush(cmd_buffer);
       }
    }
 }
@@ -1681,7 +1722,7 @@ radv_CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer, VkQueryPool queryPoo
    /* Workaround engines that forget to properly specify WAIT_BIT because some driver implicitly
     * synchronizes before query copy.
     */
-   if (cmd_buffer->device->instance->flush_before_query_copy)
+   if (cmd_buffer->device->instance->drirc.flush_before_query_copy)
       cmd_buffer->state.flush_bits |= cmd_buffer->active_query_flush_bits;
 
    /* From the Vulkan spec 1.1.108:
@@ -1934,7 +1975,7 @@ gfx10_copy_gds_query_gfx(struct radv_cmd_buffer *cmd_buffer, uint32_t gds_offset
 {
    /* Make sure GDS is idle before copying the value. */
    cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_PS_PARTIAL_FLUSH | RADV_CMD_FLAG_INV_L2;
-   si_emit_cache_flush(cmd_buffer);
+   radv_emit_cache_flush(cmd_buffer);
 
    gfx10_copy_gds_query(cmd_buffer->cs, gds_offset, va);
 }
@@ -2121,7 +2162,7 @@ emit_begin_query(struct radv_cmd_buffer *cmd_buffer, struct radv_query_pool *poo
             cmd_buffer->state.active_prims_gen_queries++;
 
             if (old_streamout_enabled != radv_is_streamout_enabled(cmd_buffer)) {
-               radv_emit_streamout_enable(cmd_buffer);
+               cmd_buffer->state.dirty |= RADV_CMD_DIRTY_STREAMOUT_ENABLE;
             }
          } else {
             cmd_buffer->state.active_prims_gen_queries++;
@@ -2268,9 +2309,9 @@ emit_end_query(struct radv_cmd_buffer *cmd_buffer, struct radv_query_pool *pool,
             cmd_buffer->state.dirty |= RADV_CMD_DIRTY_SHADER_QUERY;
       }
 
-      si_cs_emit_write_event_eop(cs, cmd_buffer->device->physical_device->rad_info.gfx_level, cmd_buffer->qf,
-                                 V_028A90_BOTTOM_OF_PIPE_TS, 0, EOP_DST_SEL_MEM, EOP_DATA_SEL_VALUE_32BIT, avail_va, 1,
-                                 cmd_buffer->gfx9_eop_bug_va);
+      radv_cs_emit_write_event_eop(cs, cmd_buffer->device->physical_device->rad_info.gfx_level, cmd_buffer->qf,
+                                   V_028A90_BOTTOM_OF_PIPE_TS, 0, EOP_DST_SEL_MEM, EOP_DATA_SEL_VALUE_32BIT, avail_va,
+                                   1, cmd_buffer->gfx9_eop_bug_va);
       break;
    }
    case VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT:
@@ -2312,7 +2353,7 @@ emit_end_query(struct radv_cmd_buffer *cmd_buffer, struct radv_query_pool *pool,
             cmd_buffer->state.active_prims_gen_queries--;
 
             if (old_streamout_enabled != radv_is_streamout_enabled(cmd_buffer)) {
-               radv_emit_streamout_enable(cmd_buffer);
+               cmd_buffer->state.dirty |= RADV_CMD_DIRTY_STREAMOUT_ENABLE;
             }
          } else {
             cmd_buffer->state.active_prims_gen_queries--;
@@ -2431,9 +2472,9 @@ radv_write_timestamp(struct radv_cmd_buffer *cmd_buffer, uint64_t va, VkPipeline
       radeon_emit(cs, va);
       radeon_emit(cs, va >> 32);
    } else {
-      si_cs_emit_write_event_eop(cs, cmd_buffer->device->physical_device->rad_info.gfx_level, cmd_buffer->qf,
-                                 V_028A90_BOTTOM_OF_PIPE_TS, 0, EOP_DST_SEL_MEM, EOP_DATA_SEL_TIMESTAMP, va, 0,
-                                 cmd_buffer->gfx9_eop_bug_va);
+      radv_cs_emit_write_event_eop(cs, cmd_buffer->device->physical_device->rad_info.gfx_level, cmd_buffer->qf,
+                                   V_028A90_BOTTOM_OF_PIPE_TS, 0, EOP_DST_SEL_MEM, EOP_DATA_SEL_TIMESTAMP, va, 0,
+                                   cmd_buffer->gfx9_eop_bug_va);
    }
 }
 
@@ -2451,7 +2492,7 @@ radv_CmdWriteTimestamp2(VkCommandBuffer commandBuffer, VkPipelineStageFlags2 sta
    radv_cs_add_buffer(cmd_buffer->device->ws, cs, pool->bo);
 
    if (cmd_buffer->qf == RADV_QUEUE_TRANSFER) {
-      if (cmd_buffer->device->instance->flush_before_timestamp_write) {
+      if (cmd_buffer->device->instance->drirc.flush_before_timestamp_write) {
          radeon_check_space(cmd_buffer->device->ws, cmd_buffer->cs, 1);
          radeon_emit(cmd_buffer->cs, SDMA_PACKET(SDMA_OPCODE_NOP, 0, 0));
       }
@@ -2465,12 +2506,12 @@ radv_CmdWriteTimestamp2(VkCommandBuffer commandBuffer, VkPipelineStageFlags2 sta
       return;
    }
 
-   if (cmd_buffer->device->instance->flush_before_timestamp_write) {
+   if (cmd_buffer->device->instance->drirc.flush_before_timestamp_write) {
       /* Make sure previously launched waves have finished */
       cmd_buffer->state.flush_bits |= RADV_CMD_FLAG_PS_PARTIAL_FLUSH | RADV_CMD_FLAG_CS_PARTIAL_FLUSH;
    }
 
-   si_emit_cache_flush(cmd_buffer);
+   radv_emit_cache_flush(cmd_buffer);
 
    ASSERTED unsigned cdw_max = radeon_check_space(cmd_buffer->device->ws, cs, 28 * num_queries);
 
@@ -2501,7 +2542,7 @@ radv_CmdWriteAccelerationStructuresPropertiesKHR(VkCommandBuffer commandBuffer, 
 
    radv_cs_add_buffer(cmd_buffer->device->ws, cs, pool->bo);
 
-   si_emit_cache_flush(cmd_buffer);
+   radv_emit_cache_flush(cmd_buffer);
 
    ASSERTED unsigned cdw_max = radeon_check_space(cmd_buffer->device->ws, cs, 6 * accelerationStructureCount);
 

@@ -85,6 +85,8 @@ variables:
   # Re-enable farm with `git mv .ci-farms{-disabled,}/$farm_name`
   # NEVER MIX FARM MAINTENANCE WITH ANY OTHER CHANGE IN THE SAME MERGE REQUEST!
   ARTIFACTS_BASE_URL: https://${CI_PROJECT_ROOT_NAMESPACE}.${CI_PAGES_DOMAIN}/-/${CI_PROJECT_NAME}/-/jobs/${CI_JOB_ID}/artifacts
+  # Python scripts for structured logger
+  PYTHONPATH: "$PYTHONPATH:$CI_PROJECT_DIR/install"
 
 default:
   before_script:
@@ -127,7 +129,7 @@ stages:
   - git-archive
   - build-x86_64
   - build-misc
-  - lint
+  - code-validation
   - amd
   - intel
   - nouveau
@@ -165,6 +167,7 @@ include:
   - local: 'src/gallium/drivers/crocus/ci/gitlab-ci.yml'
   - local: 'src/gallium/drivers/d3d12/ci/gitlab-ci.yml'
   - local: 'src/gallium/drivers/i915/ci/gitlab-ci.yml'
+  - local: 'src/gallium/drivers/r300/ci/gitlab-ci.yml'
   - local: 'src/gallium/drivers/lima/ci/gitlab-ci.yml'
   - local: 'src/gallium/drivers/llvmpipe/ci/gitlab-ci.yml'
   - local: 'src/gallium/drivers/nouveau/ci/gitlab-ci.yml'
@@ -208,6 +211,7 @@ include:
         # GitLab CI
         - .gitlab-ci.yml
         - .gitlab-ci/**/*
+        - .ci-farms/*
         # Meson
         - meson*
         - build-support/**/*
@@ -290,6 +294,32 @@ sanity:
   script:
     # ci-fairy check-commits --junit-xml=check-commits.xml
     - ci-fairy check-merge-request --require-allow-collaboration --junit-xml=check-merge-request.xml
+    - |
+      set -eu
+      image_tags=(
+        DEBIAN_BASE_TAG
+        DEBIAN_BUILD_TAG
+        DEBIAN_X86_64_TEST_ANDROID_TAG
+        DEBIAN_X86_64_TEST_GL_TAG
+        DEBIAN_X86_64_TEST_VK_TAG
+        ALPINE_X86_64_BUILD_TAG
+        ALPINE_X86_64_LAVA_SSH_TAG
+        FEDORA_X86_64_BUILD_TAG
+        KERNEL_ROOTFS_TAG
+        KERNEL_TAG
+        PKG_REPO_REV
+        WINDOWS_X64_MSVC_TAG
+        WINDOWS_X64_BUILD_TAG
+        WINDOWS_X64_TEST_TAG
+      )
+      for var in "${image_tags[@]}"
+      do
+        if [ "$(echo -n "${!var}" | wc -c)" -gt 20 ]
+        then
+          echo "$var is too long; please make sure it is at most 20 chars."
+          exit 1
+        fi
+      done
   artifacts:
     when: on_failure
     reports:

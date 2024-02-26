@@ -1751,6 +1751,9 @@ print_tex_instr(nir_tex_instr *instr, print_state *state)
       case nir_tex_src_lod:
          fprintf(fp, "(lod)");
          break;
+      case nir_tex_src_combined_lod_and_array_index_intel:
+         fprintf(fp, "(combined_lod_and_array_index_intel)");
+         break;
       case nir_tex_src_min_lod:
          fprintf(fp, "(min_lod)");
          break;
@@ -2396,12 +2399,11 @@ print_shader_info(const struct shader_info *info, FILE *fp)
    fprintf(fp, "internal: %s\n", info->internal ? "true" : "false");
 
    if (gl_shader_stage_uses_workgroup(info->stage)) {
-      fprintf(fp, "workgroup-size: %u, %u, %u%s\n",
+      fprintf(fp, "workgroup_size: %u, %u, %u%s\n",
               info->workgroup_size[0],
               info->workgroup_size[1],
               info->workgroup_size[2],
               info->workgroup_size_variable ? " (variable)" : "");
-      fprintf(fp, "shared-size: %u\n", info->shared_size);
    }
 
    fprintf(fp, "stage: %d\n"

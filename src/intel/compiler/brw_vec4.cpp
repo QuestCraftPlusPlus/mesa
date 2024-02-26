@@ -53,7 +53,7 @@ src_reg::src_reg(enum brw_reg_file file, int nr, const glsl_type *type)
 
    this->file = file;
    this->nr = nr;
-   if (type && (type->is_scalar() || type->is_vector() || type->is_matrix()))
+   if (type && (glsl_type_is_scalar(type) || glsl_type_is_vector(type) || glsl_type_is_matrix(type)))
       this->swizzle = brw_swizzle_for_size(type->vector_elements);
    else
       this->swizzle = BRW_SWIZZLE_XYZW;
@@ -1208,7 +1208,7 @@ vec4_visitor::eliminate_find_live_channel()
    bool progress = false;
    unsigned depth = 0;
 
-   if (!brw_stage_has_packed_dispatch(devinfo, stage, stage_prog_data)) {
+   if (!brw_stage_has_packed_dispatch(devinfo, stage, 0, stage_prog_data)) {
       /* The optimization below assumes that channel zero is live on thread
        * dispatch, which may not be the case if the fixed function dispatches
        * threads sparsely.
@@ -2649,10 +2649,11 @@ brw_compile_vs(const struct brw_compiler *compiler,
    }
 
    if (is_scalar) {
+      const unsigned dispatch_width = compiler->devinfo->ver >= 20 ? 16 : 8;
       prog_data->base.dispatch_mode = DISPATCH_MODE_SIMD8;
 
       fs_visitor v(compiler, &params->base, &key->base,
-                   &prog_data->base.base, nir, 8,
+                   &prog_data->base.base, nir, dispatch_width,
                    params->base.stats != NULL, debug_enabled);
       if (!v.run_vs()) {
          params->base.error_str =
@@ -2676,7 +2677,7 @@ brw_compile_vs(const struct brw_compiler *compiler,
 
          g.enable_debug(debug_name);
       }
-      g.generate_code(v.cfg, 8, v.shader_stats,
+      g.generate_code(v.cfg, dispatch_width, v.shader_stats,
                       v.performance_analysis.require(), params->base.stats);
       g.add_const_data(nir->constant_data, nir->constant_data_size);
       assembly = g.get_assembly();

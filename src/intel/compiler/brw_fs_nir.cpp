@@ -220,11 +220,7 @@ emit_system_values_block(nir_to_brw_state &ntb, nir_block *block)
          assert(s.stage == MESA_SHADER_GEOMETRY);
          reg = &ntb.system_values[SYSTEM_VALUE_INVOCATION_ID];
          if (reg->file == BAD_FILE) {
-            const fs_builder abld = ntb.bld.annotate("gl_InvocationID", NULL);
-            fs_reg g1(retype(brw_vec8_grf(1, 0), BRW_REGISTER_TYPE_UD));
-            fs_reg iid = abld.vgrf(BRW_REGISTER_TYPE_UD, 1);
-            abld.SHR(iid, g1, brw_imm_ud(27u));
-            *reg = iid;
+            *reg = s.gs_payload().instance_id;
          }
          break;
 
@@ -283,10 +279,15 @@ emit_system_values_block(nir_to_brw_state &ntb, nir_block *block)
 
             for (unsigned i = 0; i < DIV_ROUND_UP(s.dispatch_width, 16); i++) {
                const fs_builder hbld = abld.group(MIN2(16, s.dispatch_width), i);
+               /* According to the "PS Thread Payload for Normal
+                * Dispatch" pages on the BSpec, the dispatch mask is
+                * stored in R0.15/R1.15 on gfx20+ and in R1.7/R2.7 on
+                * gfx6+.
+                */
+               const struct brw_reg reg = s.devinfo->ver >= 20 ?
+                  xe2_vec1_grf(i, 15) : brw_vec1_grf(i + 1, 7);
                hbld.SHR(offset(shifted, hbld, i),
-                        stride(retype(brw_vec1_grf(1 + i, 7),
-                                      BRW_REGISTER_TYPE_UB),
-                               1, 8, 0),
+                        stride(retype(reg, BRW_REGISTER_TYPE_UB), 1, 8, 0),
                         brw_imm_v(0x76543210));
             }
 
@@ -417,6 +418,17 @@ fs_nir_emit_if(nir_to_brw_state &ntb, nir_if *if_stmt)
       invert = true;
       cond_reg = get_nir_src(ntb, cond->src[0].src);
       cond_reg = offset(cond_reg, bld, cond->src[0].swizzle[0]);
+
+      if (devinfo->ver <= 5 &&
+	  (cond->instr.pass_flags & BRW_NIR_BOOLEAN_MASK) == BRW_NIR_BOOLEAN_NEEDS_RESOLVE) {
+         /* redo boolean resolve on gen5 */
+         fs_reg masked = ntb.s.vgrf(glsl_int_type());
+         bld.AND(masked, cond_reg, brw_imm_d(1));
+         masked.negate = true;
+         fs_reg tmp = bld.vgrf(cond_reg.type);
+         bld.MOV(retype(tmp, BRW_REGISTER_TYPE_D), masked);
+         cond_reg = tmp;
+      }
    } else {
       invert = false;
       cond_reg = get_nir_src(ntb, if_stmt->condition);
@@ -540,7 +552,50 @@ optimize_frontfacing_ternary(nir_to_brw_state &ntb,
 
    fs_reg tmp = s.vgrf(glsl_int_type());
 
-   if (devinfo->ver >= 12) {
+   if (devinfo->ver >= 20) {
+      /* Gfx20+ has separate back-facing bits for each pair of
+       * subspans in order to support multiple polygons, so we need to
+       * use a <1;8,0> region in order to select the correct word for
+       * each channel.  Unfortunately they're no longer aligned to the
+       * sign bit of a 16-bit word, so a left shift is necessary.
+       */
+      fs_reg ff = ntb.bld.vgrf(BRW_REGISTER_TYPE_UW);
+
+      for (unsigned i = 0; i < DIV_ROUND_UP(s.dispatch_width, 16); i++) {
+         const fs_builder hbld = ntb.bld.group(16, i);
+         const struct brw_reg gi_uw = retype(xe2_vec1_grf(i, 9),
+                                             BRW_REGISTER_TYPE_UW);
+         hbld.SHL(offset(ff, hbld, i), stride(gi_uw, 1, 8, 0), brw_imm_ud(4));
+      }
+
+      if (value1 == -1.0f)
+         ff.negate = true;
+
+      ntb.bld.OR(subscript(tmp, BRW_REGISTER_TYPE_UW, 1), ff,
+                  brw_imm_uw(0x3f80));
+
+   } else if (devinfo->ver >= 12 && s.max_polygons == 2) {
+      /* According to the BSpec "PS Thread Payload for Normal
+       * Dispatch", the front/back facing interpolation bit is stored
+       * as bit 15 of either the R1.1 or R1.6 poly info field, for the
+       * first and second polygons respectively in multipolygon PS
+       * dispatch mode.
+       */
+      assert(s.dispatch_width == 16);
+
+      for (unsigned i = 0; i < s.max_polygons; i++) {
+         const fs_builder hbld = ntb.bld.group(8, i);
+         struct brw_reg g1 = retype(brw_vec1_grf(1, 1 + 5 * i),
+                                    BRW_REGISTER_TYPE_UW);
+
+         if (value1 == -1.0f)
+            g1.negate = true;
+
+         hbld.OR(subscript(offset(tmp, hbld, i), BRW_REGISTER_TYPE_UW, 1),
+                 g1, brw_imm_uw(0x3f80));
+      }
+
+   } else if (devinfo->ver >= 12) {
       /* Bit 15 of g1.1 is 0 if the polygon is front facing. */
       fs_reg g1 = fs_reg(retype(brw_vec1_grf(1, 1), BRW_REGISTER_TYPE_W));
 
@@ -1762,43 +1817,42 @@ fs_nir_emit_alu(nir_to_brw_state &ntb, nir_alu_instr *instr,
    case nir_op_bitfield_insert:
       unreachable("not reached: should have been lowered");
 
-   /* For all shift operations:
+   /* With regards to implicit masking of the shift counts for 8- and 16-bit
+    * types, the PRMs are **incorrect**. They falsely state that on Gen9+ only
+    * the low bits of src1 matching the size of src0 (e.g., 4-bits for W or UW
+    * src0) are used. The Bspec (backed by data from experimentation) state
+    * that 0x3f is used for Q and UQ types, and 0x1f is used for **all** other
+    * types.
     *
-    * Gen4 - Gen7: After application of source modifiers, the low 5-bits of
-    * src1 are used an unsigned value for the shift count.
-    *
-    * Gen8: As with earlier platforms, but for Q and UQ types on src0, the low
-    * 6-bit of src1 are used.
-    *
-    * Gen9+: The low bits of src1 matching the size of src0 (e.g., 4-bits for
-    * W or UW src0).
-    *
-    * The implication is that the following instruction will produce a
-    * different result on Gen9+ than on previous platforms:
-    *
-    *    shr(8)    g4<1>UW    g12<8,8,1>UW    0x0010UW
-    *
-    * where Gen9+ will shift by zero, and earlier platforms will shift by 16.
-    *
-    * This does not seem to be the case.  Experimentally, it has been
-    * determined that shifts of 16-bit values on Gen8 behave properly.  Shifts
-    * of 8-bit values on both Gen8 and Gen9 do not.  Gen11+ lowers 8-bit
-    * values, so those platforms were not tested.  No features expose access
-    * to 8- or 16-bit types on Gen7 or earlier, so those platforms were not
-    * tested either.  See
-    * https://gitlab.freedesktop.org/mesa/crucible/-/merge_requests/76.
-    *
-    * This is part of the reason 8-bit values are lowered to 16-bit on all
-    * platforms.
+    * The match the behavior expected for the NIR opcodes, explicit masks for
+    * 8- and 16-bit types must be added.
     */
    case nir_op_ishl:
-      bld.SHL(result, op[0], op[1]);
+      if (instr->def.bit_size < 32) {
+         bld.AND(result, op[1], brw_imm_ud(instr->def.bit_size - 1));
+         bld.SHL(result, op[0], result);
+      } else {
+         bld.SHL(result, op[0], op[1]);
+      }
+
       break;
    case nir_op_ishr:
-      bld.ASR(result, op[0], op[1]);
+      if (instr->def.bit_size < 32) {
+         bld.AND(result, op[1], brw_imm_ud(instr->def.bit_size - 1));
+         bld.ASR(result, op[0], result);
+      } else {
+         bld.ASR(result, op[0], op[1]);
+      }
+
       break;
    case nir_op_ushr:
-      bld.SHR(result, op[0], op[1]);
+      if (instr->def.bit_size < 32) {
+         bld.AND(result, op[1], brw_imm_ud(instr->def.bit_size - 1));
+         bld.SHR(result, op[0], result);
+      } else {
+         bld.SHR(result, op[0], op[1]);
+      }
+
       break;
 
    case nir_op_urol:
@@ -2480,9 +2534,10 @@ emit_gs_input_load(nir_to_brw_state &ntb, const fs_reg &dst,
        4 * (base_offset + nir_src_as_uint(offset_src)) < push_reg_count) {
       int imm_offset = (base_offset + nir_src_as_uint(offset_src)) * 4 +
                        nir_src_as_uint(vertex_src) * push_reg_count;
+      const fs_reg attr = fs_reg(ATTR, 0, dst.type);
       for (unsigned i = 0; i < num_components; i++) {
-         ntb.bld.MOV(offset(dst, ntb.bld, i),
-                      fs_reg(ATTR, imm_offset + i + first_component, dst.type));
+         ntb.bld.MOV(offset(dst, bld, i),
+                     offset(attr, bld, imm_offset + i + first_component));
       }
       return;
    }
@@ -2651,9 +2706,10 @@ fs_nir_emit_vs_intrinsic(nir_to_brw_state &ntb,
 
    case nir_intrinsic_load_input: {
       assert(instr->def.bit_size == 32);
-      fs_reg src = fs_reg(ATTR, nir_intrinsic_base(instr) * 4, dest.type);
-      src = offset(src, bld, nir_intrinsic_component(instr));
-      src = offset(src, bld, nir_src_as_uint(instr->src[0]));
+      const fs_reg src = offset(fs_reg(ATTR, 0, dest.type), bld,
+                                nir_intrinsic_base(instr) * 4 +
+                                nir_intrinsic_component(instr) +
+                                nir_src_as_uint(instr->src[0]));
 
       for (unsigned i = 0; i < instr->num_components; i++)
          bld.MOV(offset(dest, bld, i), offset(src, bld, i));
@@ -3149,11 +3205,10 @@ fs_nir_emit_tes_intrinsic(nir_to_brw_state &ntb,
           */
          const unsigned max_push_slots = 32;
          if (imm_offset < max_push_slots) {
-            fs_reg src = fs_reg(ATTR, imm_offset / 2, dest.type);
-            for (int i = 0; i < instr->num_components; i++) {
-               unsigned comp = 4 * (imm_offset % 2) + i + first_component;
-               bld.MOV(offset(dest, bld, i), component(src, comp));
-            }
+            const fs_reg src = horiz_offset(fs_reg(ATTR, 0, dest.type),
+                                            4 * imm_offset + first_component);
+            for (int i = 0; i < instr->num_components; i++)
+               bld.MOV(offset(dest, bld, i), component(src, i));
 
             tes_prog_data->base.urb_read_length =
                MAX2(tes_prog_data->base.urb_read_length,
@@ -3282,7 +3337,43 @@ fs_nir_emit_gs_intrinsic(nir_to_brw_state &ntb,
 static fs_reg
 fetch_render_target_array_index(const fs_builder &bld)
 {
-   if (bld.shader->devinfo->ver >= 12) {
+   const fs_visitor *v = static_cast<const fs_visitor *>(bld.shader);
+
+   if (bld.shader->devinfo->ver >= 20) {
+      /* Gfx20+ has separate Render Target Array indices for each pair
+       * of subspans in order to support multiple polygons, so we need
+       * to use a <1;8,0> region in order to select the correct word
+       * for each channel.
+       */
+      const fs_reg idx = bld.vgrf(BRW_REGISTER_TYPE_UD);
+
+      for (unsigned i = 0; i < DIV_ROUND_UP(bld.dispatch_width(), 16); i++) {
+         const fs_builder hbld = bld.group(16, i);
+         const struct brw_reg reg = retype(brw_vec1_grf(2 * i + 1, 1),
+                                           BRW_REGISTER_TYPE_UW);
+         hbld.AND(offset(idx, hbld, i), stride(reg, 1, 8, 0),
+                  brw_imm_uw(0x7ff));
+      }
+
+      return idx;
+   } else if (bld.shader->devinfo->ver >= 12 && v->max_polygons == 2) {
+      /* According to the BSpec "PS Thread Payload for Normal
+       * Dispatch", the render target array index is stored as bits
+       * 26:16 of either the R1.1 or R1.6 poly info dwords, for the
+       * first and second polygons respectively in multipolygon PS
+       * dispatch mode.
+       */
+      assert(bld.dispatch_width() == 16);
+      const fs_reg idx = bld.vgrf(BRW_REGISTER_TYPE_UD);
+
+      for (unsigned i = 0; i < v->max_polygons; i++) {
+         const fs_builder hbld = bld.group(8, i);
+         const struct brw_reg g1 = brw_uw1_reg(BRW_GENERAL_REGISTER_FILE, 1, 3 + 10 * i);
+         hbld.AND(offset(idx, hbld, i), g1, brw_imm_uw(0x7ff));
+      }
+
+      return idx;
+   } else if (bld.shader->devinfo->ver >= 12) {
       /* The render target array index is provided in the thread payload as
        * bits 26:16 of r1.1.
        */
@@ -3533,7 +3624,7 @@ emit_fragcoord_interpolation(nir_to_brw_state &ntb, fs_reg wpos)
    } else {
       bld.emit(FS_OPCODE_LINTERP, wpos,
                s.delta_xy[BRW_BARYCENTRIC_PERSPECTIVE_PIXEL],
-               component(s.interp_reg(VARYING_SLOT_POS, 2), 0));
+               s.interp_reg(bld, VARYING_SLOT_POS, 2, 0));
    }
    wpos = offset(wpos, bld, 1);
 
@@ -3546,10 +3637,47 @@ emit_frontfacing_interpolation(nir_to_brw_state &ntb)
 {
    const intel_device_info *devinfo = ntb.devinfo;
    const fs_builder &bld = ntb.bld;
+   fs_visitor &s = ntb.s;
 
    fs_reg ff = bld.vgrf(BRW_REGISTER_TYPE_D);
 
-   if (devinfo->ver >= 12) {
+   if (devinfo->ver >= 20) {
+      /* Gfx20+ has separate back-facing bits for each pair of
+       * subspans in order to support multiple polygons, so we need to
+       * use a <1;8,0> region in order to select the correct word for
+       * each channel.
+       */
+      const fs_reg tmp = bld.vgrf(BRW_REGISTER_TYPE_UW);
+
+      for (unsigned i = 0; i < DIV_ROUND_UP(s.dispatch_width, 16); i++) {
+         const fs_builder hbld = bld.group(16, i);
+         const struct brw_reg gi_uw = retype(xe2_vec1_grf(i, 9),
+                                             BRW_REGISTER_TYPE_UW);
+         hbld.AND(offset(tmp, hbld, i), gi_uw, brw_imm_uw(0x800));
+      }
+
+      bld.CMP(ff, tmp, brw_imm_uw(0), BRW_CONDITIONAL_Z);
+
+   } else if (devinfo->ver >= 12 && s.max_polygons == 2) {
+      /* According to the BSpec "PS Thread Payload for Normal
+       * Dispatch", the front/back facing interpolation bit is stored
+       * as bit 15 of either the R1.1 or R1.6 poly info field, for the
+       * first and second polygons respectively in multipolygon PS
+       * dispatch mode.
+       */
+      assert(s.dispatch_width == 16);
+      fs_reg tmp = bld.vgrf(BRW_REGISTER_TYPE_W);
+
+      for (unsigned i = 0; i < s.max_polygons; i++) {
+         const fs_builder hbld = bld.group(8, i);
+         const struct brw_reg g1 = retype(brw_vec1_grf(1, 1 + 5 * i),
+                                          BRW_REGISTER_TYPE_W);
+         hbld.ASR(offset(tmp, hbld, i), g1, brw_imm_d(15));
+      }
+
+      bld.NOT(ff, tmp);
+
+   } else if (devinfo->ver >= 12) {
       fs_reg g1 = fs_reg(retype(brw_vec1_grf(1, 1), BRW_REGISTER_TYPE_W));
 
       fs_reg tmp = bld.vgrf(BRW_REGISTER_TYPE_W);
@@ -3703,9 +3831,14 @@ emit_sampleid_setup(nir_to_brw_state &ntb)
 
       for (unsigned i = 0; i < DIV_ROUND_UP(s.dispatch_width, 16); i++) {
          const fs_builder hbld = abld.group(MIN2(16, s.dispatch_width), i);
+         /* According to the "PS Thread Payload for Normal Dispatch"
+          * pages on the BSpec, the sample ids are stored in R0.8/R1.8
+          * on gfx20+ and in R1.0/R2.0 on gfx8+.
+          */
+         const struct brw_reg id_reg = devinfo->ver >= 20 ? xe2_vec1_grf(i, 8) :
+                                       brw_vec1_grf(i + 1, 0);
          hbld.SHR(offset(tmp, hbld, i),
-                  stride(retype(brw_vec1_grf(1 + i, 0), BRW_REGISTER_TYPE_UB),
-                         1, 8, 0),
+                  stride(retype(id_reg, BRW_REGISTER_TYPE_UB), 1, 8, 0),
                   brw_imm_v(0x44440000));
       }
 
@@ -4038,7 +4171,8 @@ fs_nir_emit_fs_intrinsic(nir_to_brw_state &ntb,
          /* Only jump when the whole quad is demoted.  For historical
           * reasons this is also used for discard.
           */
-         jump->predicate = BRW_PREDICATE_ALIGN1_ANY4H;
+         jump->predicate = (devinfo->ver >= 20 ? XE2_PREDICATE_ANY :
+                            BRW_PREDICATE_ALIGN1_ANY4H);
       }
 
       if (devinfo->ver < 7)
@@ -4107,12 +4241,17 @@ fs_nir_emit_fs_intrinsic(nir_to_brw_state &ntb,
          assert(base != VARYING_SLOT_PRIMITIVE_INDICES);
          for (unsigned int i = 0; i < num_components; i++) {
             bld.MOV(offset(dest, bld, i),
-                    retype(s.per_primitive_reg(base, comp + i), dest.type));
+                    retype(s.per_primitive_reg(bld, base, comp + i), dest.type));
          }
       } else {
+         /* Gfx20+ packs the plane parameters of a single logical
+          * input in a vec3 format instead of the previously used vec4
+          * format.
+          */
+         const unsigned k = devinfo->ver >= 20 ? 0 : 3;
          for (unsigned int i = 0; i < num_components; i++) {
             bld.MOV(offset(dest, bld, i),
-                    retype(component(s.interp_reg(base, comp + i), 3), dest.type));
+                    retype(s.interp_reg(bld, base, comp + i, k), dest.type));
          }
       }
       break;
@@ -4121,12 +4260,24 @@ fs_nir_emit_fs_intrinsic(nir_to_brw_state &ntb,
    case nir_intrinsic_load_fs_input_interp_deltas: {
       assert(s.stage == MESA_SHADER_FRAGMENT);
       assert(nir_src_as_uint(instr->src[0]) == 0);
-      fs_reg interp = s.interp_reg(nir_intrinsic_base(instr),
-                                    nir_intrinsic_component(instr));
+      const unsigned base = nir_intrinsic_base(instr);
+      const unsigned comp = nir_intrinsic_component(instr);
       dest.type = BRW_REGISTER_TYPE_F;
-      bld.MOV(offset(dest, bld, 0), component(interp, 3));
-      bld.MOV(offset(dest, bld, 1), component(interp, 1));
-      bld.MOV(offset(dest, bld, 2), component(interp, 0));
+
+      /* Gfx20+ packs the plane parameters of a single logical
+       * input in a vec3 format instead of the previously used vec4
+       * format.
+       */
+      if (devinfo->ver >= 20) {
+         bld.MOV(offset(dest, bld, 0), s.interp_reg(bld, base, comp, 0));
+         bld.MOV(offset(dest, bld, 1), s.interp_reg(bld, base, comp, 2));
+         bld.MOV(offset(dest, bld, 2), s.interp_reg(bld, base, comp, 1));
+      } else {
+         bld.MOV(offset(dest, bld, 0), s.interp_reg(bld, base, comp, 3));
+         bld.MOV(offset(dest, bld, 1), s.interp_reg(bld, base, comp, 1));
+         bld.MOV(offset(dest, bld, 2), s.interp_reg(bld, base, comp, 0));
+      }
+
       break;
    }
 
@@ -4235,8 +4386,8 @@ fs_nir_emit_fs_intrinsic(nir_to_brw_state &ntb,
 
       for (unsigned int i = 0; i < instr->num_components; i++) {
          fs_reg interp =
-            component(s.interp_reg(nir_intrinsic_base(instr),
-                                    nir_intrinsic_component(instr) + i), 0);
+            s.interp_reg(bld, nir_intrinsic_base(instr),
+                         nir_intrinsic_component(instr) + i, 0);
          interp.type = BRW_REGISTER_TYPE_F;
          dest.type = BRW_REGISTER_TYPE_F;
 
@@ -4296,14 +4447,15 @@ fs_nir_emit_cs_intrinsic(nir_to_brw_state &ntb,
       s.cs_payload().load_subgroup_id(bld, dest);
       break;
 
-   case nir_intrinsic_load_local_invocation_id: {
-      fs_reg val = ntb.system_values[SYSTEM_VALUE_LOCAL_INVOCATION_ID];
-      assert(val.file != BAD_FILE);
-      dest.type = val.type;
+   case nir_intrinsic_load_local_invocation_id:
+      /* This is only used for hardware generated local IDs. */
+      assert(cs_prog_data->generate_local_id);
+
+      dest.type = BRW_REGISTER_TYPE_UD;
+
       for (unsigned i = 0; i < 3; i++)
-         bld.MOV(offset(dest, bld, i), offset(val, bld, i));
+         bld.MOV(offset(dest, bld, i), s.cs_payload().local_invocation_id[i]);
       break;
-   }
 
    case nir_intrinsic_load_workgroup_id:
    case nir_intrinsic_load_workgroup_id_zero_base: {
@@ -4440,6 +4592,66 @@ fs_nir_emit_cs_intrinsic(nir_to_brw_state &ntb,
        * crocus/iris_setup_uniforms() for the variable group size case.
        */
       unreachable("Should have been lowered");
+      break;
+   }
+
+   case nir_intrinsic_dpas_intel: {
+      const unsigned sdepth = nir_intrinsic_systolic_depth(instr);
+      const unsigned rcount = nir_intrinsic_repeat_count(instr);
+
+      const brw_reg_type dest_type =
+         brw_type_for_nir_type(devinfo, nir_intrinsic_dest_type(instr));
+      const brw_reg_type src_type =
+         brw_type_for_nir_type(devinfo, nir_intrinsic_src_type(instr));
+
+      dest = retype(dest, dest_type);
+      fs_reg src2 = retype(get_nir_src(ntb, instr->src[2]), dest_type);
+      const fs_reg dest_hf = dest;
+
+      fs_builder bld8 = bld.exec_all().group(8, 0);
+      fs_builder bld16 = bld.exec_all().group(16, 0);
+
+      /* DG2 cannot have the destination or source 0 of DPAS be float16. It is
+       * still advantageous to support these formats for memory and bandwidth
+       * savings.
+       *
+       * The float16 source must be expanded to float32.
+       */
+      if (devinfo->verx10 == 125 && dest_type == BRW_REGISTER_TYPE_HF &&
+          !s.compiler->lower_dpas) {
+         dest = bld8.vgrf(BRW_REGISTER_TYPE_F, rcount);
+
+         if (src2.file != ARF) {
+            const fs_reg src2_hf = src2;
+
+            src2 = bld8.vgrf(BRW_REGISTER_TYPE_F, rcount);
+
+            for (unsigned i = 0; i < 4; i++) {
+               bld16.MOV(byte_offset(src2, REG_SIZE * i * 2),
+                         byte_offset(src2_hf, REG_SIZE * i));
+            }
+         } else {
+            src2 = retype(src2, BRW_REGISTER_TYPE_F);
+         }
+      }
+
+      bld8.DPAS(dest,
+                src2,
+                retype(get_nir_src(ntb, instr->src[1]), src_type),
+                retype(get_nir_src(ntb, instr->src[0]), src_type),
+                sdepth,
+                rcount)
+         ->saturate = nir_intrinsic_saturate(instr);
+
+      /* Compact the destination to float16 (from float32). */
+      if (!dest.equals(dest_hf)) {
+         for (unsigned i = 0; i < 4; i++) {
+            bld16.MOV(byte_offset(dest_hf, REG_SIZE * i),
+                      byte_offset(dest, REG_SIZE * i * 2));
+         }
+      }
+
+      cs_prog_data->uses_systolic = true;
       break;
    }
 
@@ -6952,7 +7164,7 @@ fs_nir_emit_intrinsic(nir_to_brw_state &ntb,
       unreachable("not reached");
 
    case nir_intrinsic_vote_any: {
-      const fs_builder ubld = bld.exec_all().group(1, 0);
+      const fs_builder ubld1 = bld.exec_all().group(1, 0);
 
       /* The any/all predicates do not consider channel enables. To prevent
        * dead channels from affecting the result, we initialize the flag with
@@ -6960,10 +7172,10 @@ fs_nir_emit_intrinsic(nir_to_brw_state &ntb,
        */
       if (s.dispatch_width == 32) {
          /* For SIMD32, we use a UD type so we fill both f0.0 and f0.1. */
-         ubld.MOV(retype(brw_flag_reg(0, 0), BRW_REGISTER_TYPE_UD),
-                         brw_imm_ud(0));
+         ubld1.MOV(retype(brw_flag_reg(0, 0), BRW_REGISTER_TYPE_UD),
+                   brw_imm_ud(0));
       } else {
-         ubld.MOV(brw_flag_reg(0, 0), brw_imm_uw(0));
+         ubld1.MOV(brw_flag_reg(0, 0), brw_imm_uw(0));
       }
       bld.CMP(bld.null_reg_d(), get_nir_src(ntb, instr->src[0]), brw_imm_d(0), BRW_CONDITIONAL_NZ);
 
@@ -6973,18 +7185,20 @@ fs_nir_emit_intrinsic(nir_to_brw_state &ntb,
        * getting garbage in the second half.  Work around this by using a pair
        * of 1-wide MOVs and scattering the result.
        */
+      const fs_builder ubld = devinfo->ver >= 20 ? bld.exec_all() : ubld1;
       fs_reg res1 = ubld.vgrf(BRW_REGISTER_TYPE_D);
       ubld.MOV(res1, brw_imm_d(0));
-      set_predicate(s.dispatch_width == 8  ? BRW_PREDICATE_ALIGN1_ANY8H :
+      set_predicate(devinfo->ver >= 20 ? XE2_PREDICATE_ANY :
+                    s.dispatch_width == 8  ? BRW_PREDICATE_ALIGN1_ANY8H :
                     s.dispatch_width == 16 ? BRW_PREDICATE_ALIGN1_ANY16H :
-                                              BRW_PREDICATE_ALIGN1_ANY32H,
+                                             BRW_PREDICATE_ALIGN1_ANY32H,
                     ubld.MOV(res1, brw_imm_d(-1)));
 
       bld.MOV(retype(dest, BRW_REGISTER_TYPE_D), component(res1, 0));
       break;
    }
    case nir_intrinsic_vote_all: {
-      const fs_builder ubld = bld.exec_all().group(1, 0);
+      const fs_builder ubld1 = bld.exec_all().group(1, 0);
 
       /* The any/all predicates do not consider channel enables. To prevent
        * dead channels from affecting the result, we initialize the flag with
@@ -6992,10 +7206,10 @@ fs_nir_emit_intrinsic(nir_to_brw_state &ntb,
        */
       if (s.dispatch_width == 32) {
          /* For SIMD32, we use a UD type so we fill both f0.0 and f0.1. */
-         ubld.MOV(retype(brw_flag_reg(0, 0), BRW_REGISTER_TYPE_UD),
-                         brw_imm_ud(0xffffffff));
+         ubld1.MOV(retype(brw_flag_reg(0, 0), BRW_REGISTER_TYPE_UD),
+                   brw_imm_ud(0xffffffff));
       } else {
-         ubld.MOV(brw_flag_reg(0, 0), brw_imm_uw(0xffff));
+         ubld1.MOV(brw_flag_reg(0, 0), brw_imm_uw(0xffff));
       }
       bld.CMP(bld.null_reg_d(), get_nir_src(ntb, instr->src[0]), brw_imm_d(0), BRW_CONDITIONAL_NZ);
 
@@ -7005,11 +7219,13 @@ fs_nir_emit_intrinsic(nir_to_brw_state &ntb,
        * getting garbage in the second half.  Work around this by using a pair
        * of 1-wide MOVs and scattering the result.
        */
+      const fs_builder ubld = devinfo->ver >= 20 ? bld.exec_all() : ubld1;
       fs_reg res1 = ubld.vgrf(BRW_REGISTER_TYPE_D);
       ubld.MOV(res1, brw_imm_d(0));
-      set_predicate(s.dispatch_width == 8  ? BRW_PREDICATE_ALIGN1_ALL8H :
+      set_predicate(devinfo->ver >= 20 ? XE2_PREDICATE_ALL :
+                    s.dispatch_width == 8  ? BRW_PREDICATE_ALIGN1_ALL8H :
                     s.dispatch_width == 16 ? BRW_PREDICATE_ALIGN1_ALL16H :
-                                              BRW_PREDICATE_ALIGN1_ALL32H,
+                                             BRW_PREDICATE_ALIGN1_ALL32H,
                     ubld.MOV(res1, brw_imm_d(-1)));
 
       bld.MOV(retype(dest, BRW_REGISTER_TYPE_D), component(res1, 0));
@@ -7025,7 +7241,7 @@ fs_nir_emit_intrinsic(nir_to_brw_state &ntb,
       }
 
       fs_reg uniformized = bld.emit_uniformize(value);
-      const fs_builder ubld = bld.exec_all().group(1, 0);
+      const fs_builder ubld1 = bld.exec_all().group(1, 0);
 
       /* The any/all predicates do not consider channel enables. To prevent
        * dead channels from affecting the result, we initialize the flag with
@@ -7033,10 +7249,10 @@ fs_nir_emit_intrinsic(nir_to_brw_state &ntb,
        */
       if (s.dispatch_width == 32) {
          /* For SIMD32, we use a UD type so we fill both f0.0 and f0.1. */
-         ubld.MOV(retype(brw_flag_reg(0, 0), BRW_REGISTER_TYPE_UD),
+         ubld1.MOV(retype(brw_flag_reg(0, 0), BRW_REGISTER_TYPE_UD),
                          brw_imm_ud(0xffffffff));
       } else {
-         ubld.MOV(brw_flag_reg(0, 0), brw_imm_uw(0xffff));
+         ubld1.MOV(brw_flag_reg(0, 0), brw_imm_uw(0xffff));
       }
       bld.CMP(bld.null_reg_d(), value, uniformized, BRW_CONDITIONAL_Z);
 
@@ -7046,11 +7262,13 @@ fs_nir_emit_intrinsic(nir_to_brw_state &ntb,
        * getting garbage in the second half.  Work around this by using a pair
        * of 1-wide MOVs and scattering the result.
        */
+      const fs_builder ubld = devinfo->ver >= 20 ? bld.exec_all() : ubld1;
       fs_reg res1 = ubld.vgrf(BRW_REGISTER_TYPE_D);
       ubld.MOV(res1, brw_imm_d(0));
-      set_predicate(s.dispatch_width == 8  ? BRW_PREDICATE_ALIGN1_ALL8H :
+      set_predicate(devinfo->ver >= 20 ? XE2_PREDICATE_ALL :
+                    s.dispatch_width == 8  ? BRW_PREDICATE_ALIGN1_ALL8H :
                     s.dispatch_width == 16 ? BRW_PREDICATE_ALIGN1_ALL16H :
-                                              BRW_PREDICATE_ALIGN1_ALL32H,
+                                             BRW_PREDICATE_ALIGN1_ALL32H,
                     ubld.MOV(res1, brw_imm_d(-1)));
 
       bld.MOV(retype(dest, BRW_REGISTER_TYPE_D), component(res1, 0));
@@ -7800,12 +8018,17 @@ fs_nir_emit_texture(nir_to_brw_state &ntb,
    if (instr->sampler_dim == GLSL_SAMPLER_DIM_BUF)
       srcs[TEX_LOGICAL_SRC_LOD] = brw_imm_d(0);
 
+   ASSERTED bool got_lod = false;
+   ASSERTED bool got_bias = false;
    uint32_t header_bits = 0;
    for (unsigned i = 0; i < instr->num_srcs; i++) {
       nir_src nir_src = instr->src[i].src;
       fs_reg src = get_nir_src(ntb, nir_src);
       switch (instr->src[i].src_type) {
       case nir_tex_src_bias:
+         assert(!got_lod);
+         got_bias = true;
+
          srcs[TEX_LOGICAL_SRC_LOD] =
             retype(get_nir_src_imm(ntb, instr->src[i].src), BRW_REGISTER_TYPE_F);
          break;
@@ -7833,6 +8056,9 @@ fs_nir_emit_texture(nir_to_brw_state &ntb,
          srcs[TEX_LOGICAL_SRC_LOD2] = retype(src, BRW_REGISTER_TYPE_F);
          break;
       case nir_tex_src_lod:
+         assert(!got_bias);
+         got_lod = true;
+
          switch (instr->op) {
          case nir_texop_txs:
             srcs[TEX_LOGICAL_SRC_LOD] =
@@ -7922,6 +8148,15 @@ fs_nir_emit_texture(nir_to_brw_state &ntb,
       case nir_tex_src_ms_mcs_intel:
          assert(instr->op == nir_texop_txf_ms);
          srcs[TEX_LOGICAL_SRC_MCS] = retype(src, BRW_REGISTER_TYPE_D);
+         break;
+
+      case nir_tex_src_combined_lod_and_array_index_intel:
+         assert(!got_lod && !got_bias);
+         got_lod = true;
+
+         assert(instr->op == nir_texop_txl || instr->op == nir_texop_txb);
+         srcs[TEX_LOGICAL_SRC_LOD] =
+            retype(get_nir_src_imm(ntb, instr->src[i].src), BRW_REGISTER_TYPE_F);
          break;
 
       default:

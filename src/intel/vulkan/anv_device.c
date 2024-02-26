@@ -48,7 +48,7 @@
 #include "util/os_file.h"
 #include "util/os_misc.h"
 #include "util/u_atomic.h"
-#ifdef ANDROID
+#if DETECT_OS_ANDROID
 #include "util/u_gralloc/u_gralloc.h"
 #endif
 #include "util/u_string.h"
@@ -96,11 +96,12 @@ static const driOptionDescription anv_dri_options[] = {
       DRI_CONF_ALWAYS_FLUSH_CACHE(false)
       DRI_CONF_VK_WSI_FORCE_BGRA8_UNORM_FIRST(false)
       DRI_CONF_VK_WSI_FORCE_SWAPCHAIN_TO_CURRENT_EXTENT(false)
+      DRI_CONF_VK_X11_IGNORE_SUBOPTIMAL(false)
       DRI_CONF_LIMIT_TRIG_INPUT_RANGE(false)
       DRI_CONF_ANV_MESH_CONV_PRIM_ATTRS_TO_VERT_ATTRS(-2)
       DRI_CONF_FORCE_VK_VENDOR(0)
       DRI_CONF_FAKE_SPARSE(false)
-#if defined(ANDROID) && ANDROID_API_LEVEL >= 34
+#if DETECT_OS_ANDROID && ANDROID_API_LEVEL >= 34
       DRI_CONF_VK_REQUIRE_ASTC(true)
 #else
       DRI_CONF_VK_REQUIRE_ASTC(false)
@@ -226,6 +227,7 @@ get_device_extensions(const struct anv_physical_device *device,
       .KHR_buffer_device_address             = true,
       .KHR_calibrated_timestamps             = device->has_reg_timestamp,
       .KHR_copy_commands2                    = true,
+      .KHR_cooperative_matrix                = anv_has_cooperative_matrix(device),
       .KHR_create_renderpass2                = true,
       .KHR_dedicated_allocation              = true,
       .KHR_deferred_host_operations          = true,
@@ -251,11 +253,15 @@ get_device_extensions(const struct anv_physical_device *device,
 #ifdef ANV_USE_WSI_PLATFORM
       .KHR_incremental_present               = true,
 #endif
+      .KHR_index_type_uint8                  = true,
+      .KHR_line_rasterization                = true,
+      .KHR_load_store_op_none                = true,
       .KHR_maintenance1                      = true,
       .KHR_maintenance2                      = true,
       .KHR_maintenance3                      = true,
       .KHR_maintenance4                      = true,
       .KHR_maintenance5                      = true,
+      .KHR_maintenance6                      = true,
       .KHR_map_memory2                       = true,
       .KHR_multiview                         = true,
       .KHR_performance_query =
@@ -288,11 +294,13 @@ get_device_extensions(const struct anv_physical_device *device,
       .KHR_shader_atomic_int64               = true,
       .KHR_shader_clock                      = true,
       .KHR_shader_draw_parameters            = true,
+      .KHR_shader_expect_assume              = true,
       .KHR_shader_float16_int8               = !device->instance->no_16bit,
       .KHR_shader_float_controls             = true,
       .KHR_shader_integer_dot_product        = true,
       .KHR_shader_non_semantic_info          = true,
       .KHR_shader_subgroup_extended_types    = true,
+      .KHR_shader_subgroup_rotate            = true,
       .KHR_shader_subgroup_uniform_control_flow = true,
       .KHR_shader_terminate_invocation       = true,
       .KHR_spirv_1_4                         = true,
@@ -314,6 +322,8 @@ get_device_extensions(const struct anv_physical_device *device,
       .KHR_workgroup_memory_explicit_layout  = true,
       .KHR_zero_initialize_workgroup_memory  = true,
       .EXT_4444_formats                      = true,
+      .EXT_attachment_feedback_loop_layout   = true,
+      .EXT_attachment_feedback_loop_dynamic_state = true,
       .EXT_border_color_swizzle              = true,
       .EXT_buffer_device_address             = true,
       .EXT_calibrated_timestamps             = device->has_reg_timestamp,
@@ -395,7 +405,7 @@ get_device_extensions(const struct anv_physical_device *device,
       .EXT_vertex_input_dynamic_state        = true,
       .EXT_ycbcr_image_arrays                = true,
       .AMD_buffer_marker                     = true,
-#ifdef ANDROID
+#if DETECT_OS_ANDROID
       .ANDROID_external_memory_android_hardware_buffer = true,
       .ANDROID_native_buffer                 = true,
 #endif
@@ -858,10 +868,30 @@ get_features(const struct anv_physical_device *pdevice,
       /* VK_KHR_maintenance5 */
       .maintenance5 = true,
 
+      /* VK_KHR_maintenance6 */
+      .maintenance6 = true,
+
       /* VK_EXT_nested_command_buffer */
       .nestedCommandBuffer = true,
       .nestedCommandBufferRendering = true,
       .nestedCommandBufferSimultaneousUse = false,
+
+      /* VK_KHR_cooperative_matrix */
+      .cooperativeMatrix = anv_has_cooperative_matrix(pdevice),
+
+
+      /* VK_KHR_shader_subgroup_rotate */
+      .shaderSubgroupRotate = true,
+      .shaderSubgroupRotateClustered = true,
+
+      /* VK_EXT_attachment_feedback_loop_layout */
+      .attachmentFeedbackLoopLayout = true,
+
+      /* VK_EXT_attachment_feedback_loop_dynamic_state */
+      .attachmentFeedbackLoopDynamicState = true,
+
+      /* VK_KHR_shader_expect_assume */
+      .shaderExpectAssume = true,
    };
 
    /* The new DOOM and Wolfenstein games require depthBounds without
@@ -1319,6 +1349,9 @@ get_properties(const struct anv_physical_device *pdevice,
       .sparseResidencyStandard3DBlockShape = has_sparse_or_fake,
       .sparseResidencyAlignedMipSize = false,
       .sparseResidencyNonResidentStrict = has_sparse_or_fake,
+
+      /* VK_KHR_cooperative_matrix */
+      .cooperativeMatrixSupportedStages = VK_SHADER_STAGE_COMPUTE_BIT,
    };
 
    snprintf(props->deviceName, sizeof(props->deviceName),
@@ -1365,15 +1398,7 @@ get_properties(const struct anv_physical_device *pdevice,
       props->fragmentShadingRateWithConservativeRasterization = true;
       props->fragmentShadingRateWithFragmentShaderInterlock = true;
       props->fragmentShadingRateWithCustomSampleLocations = true;
-
-      /* Fix in DG2_G10_C0 and DG2_G11_B0. Consider any other Sku as having
-       * the fix.
-       */
-      props->fragmentShadingRateStrictMultiplyCombiner =
-         pdevice->info.platform == INTEL_PLATFORM_DG2_G10 ?
-         pdevice->info.revision >= 8 :
-         pdevice->info.platform == INTEL_PLATFORM_DG2_G11 ?
-         pdevice->info.revision >= 4 : true;
+      props->fragmentShadingRateStrictMultiplyCombiner = true;
 
       if (pdevice->info.has_coarse_pixel_primitive_and_cb) {
          props->minFragmentShadingRateAttachmentTexelSize = (VkExtent2D) { 8, 8 };
@@ -1395,6 +1420,13 @@ get_properties(const struct anv_physical_device *pdevice,
       props->polygonModePointSize = true;
       props->nonStrictSinglePixelWideLinesUseParallelogram = false;
       props->nonStrictWideLinesUseParallelogram = false;
+   }
+
+   /* VK_KHR_maintenance6 */
+   {
+      props->blockTexelViewCompatibleMultipleLayers = true;
+      props->maxCombinedImageSamplerDescriptorCount = 3;
+      props->fragmentShadingRateClampCombinerInputs = true;
    }
 
    /* VK_KHR_performance_query */
@@ -1715,30 +1747,13 @@ get_properties(const struct anv_physical_device *pdevice,
    }
 }
 
-static uint64_t
-anv_compute_sys_heap_size(struct anv_physical_device *device,
-                          uint64_t total_ram)
-{
-   /* We don't want to burn too much ram with the GPU.  If the user has 4GiB
-    * or less, we use at most half.  If they have more than 4GiB, we use 3/4.
-    */
-   uint64_t available_ram;
-   if (total_ram <= 4ull * 1024ull * 1024ull * 1024ull)
-      available_ram = total_ram / 2;
-   else
-      available_ram = total_ram * 3 / 4;
-
-   return available_ram;
-}
-
 static VkResult MUST_CHECK
 anv_init_meminfo(struct anv_physical_device *device, int fd)
 {
    const struct intel_device_info *devinfo = &device->info;
 
    device->sys.region = &devinfo->mem.sram.mem;
-   device->sys.size =
-      anv_compute_sys_heap_size(device, devinfo->mem.sram.mappable.size);
+   device->sys.size = devinfo->mem.sram.mappable.size;
    device->sys.available = devinfo->mem.sram.mappable.free;
 
    device->vram_mappable.region = &devinfo->mem.vram.mem;
@@ -2075,11 +2090,6 @@ anv_physical_device_init_queue_families(struct anv_physical_device *pdevice)
             .engine_class = INTEL_ENGINE_CLASS_COPY,
          };
       }
-
-      /* Increase count below when other families are added as a reminder to
-       * increase the ANV_MAX_QUEUE_FAMILIES value.
-       */
-      STATIC_ASSERT(ANV_MAX_QUEUE_FAMILIES >= 4);
    } else {
       /* Default to a single render queue */
       pdevice->queue.families[family_count++] = (struct anv_queue_family) {
@@ -2142,8 +2152,8 @@ anv_physical_device_try_create(struct vk_instance *vk_instance,
    }
 
    struct intel_device_info devinfo;
-   if (!intel_get_device_info_from_fd(fd, &devinfo)) {
-      result = vk_error(instance, VK_ERROR_INCOMPATIBLE_DRIVER);
+   if (!intel_get_device_info_from_fd(fd, &devinfo, 9, -1)) {
+      result = VK_ERROR_INCOMPATIBLE_DRIVER;
       goto fail_fd;
    }
 
@@ -2235,10 +2245,8 @@ anv_physical_device_try_create(struct vk_instance *vk_instance,
    if (debug_get_bool_option("ANV_QUEUE_THREAD_DISABLE", false))
       device->has_exec_timeline = false;
 
-
-   device->generated_indirect_draws =
-      debug_get_bool_option("ANV_ENABLE_GENERATED_INDIRECT_DRAWS",
-                            true);
+   device->has_cooperative_matrix =
+      device->info.cooperative_matrix_configurations[0].scope != INTEL_CMAT_SCOPE_NONE;
 
    unsigned st_idx = 0;
 
@@ -2558,7 +2566,7 @@ void anv_GetPhysicalDeviceProperties2(
    /* Unfortunately the runtime isn't handling ANDROID extensions. */
    vk_foreach_struct(ext, pProperties->pNext) {
       switch (ext->sType) {
-#ifdef ANDROID
+#if DETECT_OS_ANDROID
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wswitch"
       case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENTATION_PROPERTIES_ANDROID: {
@@ -2834,7 +2842,8 @@ anv_device_init_trivial_batch(struct anv_device *device)
 {
    VkResult result = anv_device_alloc_bo(device, "trivial-batch", 4096,
                                          ANV_BO_ALLOC_MAPPED |
-                                         ANV_BO_ALLOC_HOST_COHERENT,
+                                         ANV_BO_ALLOC_HOST_COHERENT |
+                                         ANV_BO_ALLOC_INTERNAL,
                                          0 /* explicit_address */,
                                          &device->trivial_batch_bo);
    if (result != VK_SUCCESS)
@@ -3096,19 +3105,31 @@ VkResult anv_CreateDevice(
    bool override_initial_entrypoints = true;
    if (physical_device->instance->vk.app_info.app_name &&
        !strcmp(physical_device->instance->vk.app_info.app_name, "HITMAN3.exe")) {
-      vk_device_dispatch_table_from_entrypoints(&dispatch_table, &hitman3_device_entrypoints, true);
+      vk_device_dispatch_table_from_entrypoints(&dispatch_table,
+                                                &anv_hitman3_device_entrypoints,
+                                                true);
       override_initial_entrypoints = false;
    }
    if (physical_device->info.ver < 12 &&
        physical_device->instance->vk.app_info.app_name &&
        !strcmp(physical_device->instance->vk.app_info.app_name, "DOOM 64")) {
-      vk_device_dispatch_table_from_entrypoints(&dispatch_table, &doom64_device_entrypoints, true);
+      vk_device_dispatch_table_from_entrypoints(&dispatch_table,
+                                                &anv_doom64_device_entrypoints,
+                                                true);
       override_initial_entrypoints = false;
    }
-#ifdef ANDROID
-   vk_device_dispatch_table_from_entrypoints(&dispatch_table, &android_device_entrypoints, true);
+#if DETECT_OS_ANDROID
+   vk_device_dispatch_table_from_entrypoints(&dispatch_table,
+                                             &anv_android_device_entrypoints,
+                                             true);
    override_initial_entrypoints = false;
 #endif
+   if (physical_device->instance->vk.trace_mode & VK_TRACE_MODE_RMV) {
+      vk_device_dispatch_table_from_entrypoints(&dispatch_table,
+                                                &anv_rmv_device_entrypoints,
+                                                true);
+      override_initial_entrypoints = false;
+   }
    vk_device_dispatch_table_from_entrypoints(&dispatch_table,
       anv_genX(&physical_device->info, device_entrypoints),
       override_initial_entrypoints);
@@ -3116,6 +3137,7 @@ VkResult anv_CreateDevice(
       &anv_device_entrypoints, false);
    vk_device_dispatch_table_from_entrypoints(&dispatch_table,
       &wsi_device_entrypoints, false);
+
 
    result = vk_device_init(&device->vk, &physical_device->vk,
                            &dispatch_table, pCreateInfo, pAllocator);
@@ -3255,6 +3277,9 @@ VkResult anv_CreateDevice(
       goto fail_mutex;
    }
    pthread_condattr_destroy(&condattr);
+
+   if (physical_device->instance->vk.trace_mode & VK_TRACE_MODE_RMV)
+      anv_memory_trace_init(device);
 
    result = anv_bo_cache_init(&device->bo_cache, device);
    if (result != VK_SUCCESS)
@@ -3416,7 +3441,8 @@ VkResult anv_CreateDevice(
    result = anv_device_alloc_bo(device, "workaround", 8192,
                                 ANV_BO_ALLOC_CAPTURE |
                                 ANV_BO_ALLOC_HOST_COHERENT |
-                                ANV_BO_ALLOC_MAPPED,
+                                ANV_BO_ALLOC_MAPPED |
+                                ANV_BO_ALLOC_INTERNAL,
                                 0 /* explicit_address */,
                                 &device->workaround_bo);
    if (result != VK_SUCCESS)
@@ -3447,7 +3473,7 @@ VkResult anv_CreateDevice(
 
       result = anv_device_alloc_bo(device, "ray queries",
                                    ray_queries_size,
-                                   0,
+                                   ANV_BO_ALLOC_INTERNAL,
                                    0 /* explicit_address */,
                                    &device->ray_query_bo);
       if (result != VK_SUCCESS)
@@ -3520,7 +3546,7 @@ VkResult anv_CreateDevice(
       result = anv_device_alloc_bo(device,
                                    "rt-btd-fifo",
                                    btd_fifo_bo_size,
-                                   0 /* alloc_flags */,
+                                   ANV_BO_ALLOC_INTERNAL,
                                    0 /* explicit_address */,
                                    &device->btd_fifo_bo);
       if (result != VK_SUCCESS)
@@ -3567,7 +3593,7 @@ VkResult anv_CreateDevice(
       goto fail_internal_cache;
    }
 
-#ifdef ANDROID
+#if DETECT_OS_ANDROID
    device->u_gralloc = u_gralloc_create(U_GRALLOC_TYPE_AUTO);
 #endif
 
@@ -3724,9 +3750,11 @@ void anv_DestroyDevice(
    if (!device)
       return;
 
-#ifdef ANDROID
+#if DETECT_OS_ANDROID
    u_gralloc_destroy(&device->u_gralloc);
 #endif
+
+   anv_memory_trace_finish(device);
 
    struct anv_physical_device *pdevice = device->physical;
 
@@ -3989,10 +4017,14 @@ VkResult anv_AllocateMemory(
 
    const VkImportMemoryFdInfoKHR *fd_info = NULL;
    const VkMemoryDedicatedAllocateInfo *dedicated_info = NULL;
+   const struct wsi_memory_allocate_info *wsi_info = NULL;
    uint64_t client_address = 0;
 
    vk_foreach_struct_const(ext, pAllocateInfo->pNext) {
-      switch (ext->sType) {
+      /* VK_STRUCTURE_TYPE_WSI_MEMORY_ALLOCATE_INFO_MESA isn't a real enum
+       * value, so use cast to avoid compiler warn
+       */
+      switch ((uint32_t)ext->sType) {
       case VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO:
       case VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID:
       case VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT:
@@ -4007,7 +4039,6 @@ VkResult anv_AllocateMemory(
 
       case VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO:
          dedicated_info = (void *)ext;
-         alloc_flags |= ANV_BO_ALLOC_DEDICATED;
          break;
 
       case VK_STRUCTURE_TYPE_MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO: {
@@ -4017,21 +4048,12 @@ VkResult anv_AllocateMemory(
          break;
       }
 
+      case VK_STRUCTURE_TYPE_WSI_MEMORY_ALLOCATE_INFO_MESA:
+         wsi_info = (void *)ext;
+         break;
+
       default:
-         /* VK_STRUCTURE_TYPE_WSI_MEMORY_ALLOCATE_INFO_MESA isn't a real
-          * enum value, so use conditional to avoid compiler warn
-          */
-         if (ext->sType == VK_STRUCTURE_TYPE_WSI_MEMORY_ALLOCATE_INFO_MESA) {
-            /* TODO: Android, ChromeOS and other applications may need another
-             * way to allocate buffers that can be scanout to display but it
-             * should pretty easy to catch those as Xe KMD driver will print
-             * warnings in dmesg when scanning buffers allocated without
-             * proper flag set.
-             */
-            alloc_flags |= ANV_BO_ALLOC_SCANOUT;
-         } else {
-            anv_debug_ignored_stype(ext->sType);
-         }
+         anv_debug_ignored_stype(ext->sType);
          break;
       }
    }
@@ -4055,12 +4077,52 @@ VkResult anv_AllocateMemory(
    if (mem->vk.alloc_flags & VK_MEMORY_PROPERTY_PROTECTED_BIT)
       alloc_flags |= ANV_BO_ALLOC_PROTECTED;
 
-   /* Anything imported or exported is EXTERNAL. Apply implicit sync to be
-    * compatible with clients relying on implicit fencing. This matches the
-    * behavior in iris i915_batch_submit. An example client is VA-API.
+   /* For now, always allocated AUX-TT aligned memory, regardless of dedicated
+    * allocations. An application can for example, suballocate a large
+    * VkDeviceMemory and try to bind an image created with a CCS modifier. In
+    * that case we cannot disable CCS if the alignment doesn´t meet the AUX-TT
+    * requirements, so we need to ensure both the VkDeviceMemory and the
+    * alignment reported through vkGetImageMemoryRequirements() meet the
+    * AUX-TT requirement.
+    *
+    * TODO: when we enable EXT_descriptor_buffer, we'll be able to drop the
+    * AUX-TT alignment for that type of allocation.
     */
-   if (mem->vk.export_handle_types || mem->vk.import_handle_type)
-      alloc_flags |= (ANV_BO_ALLOC_EXTERNAL | ANV_BO_ALLOC_IMPLICIT_SYNC);
+   if (device->info->has_aux_map)
+      alloc_flags |= ANV_BO_ALLOC_AUX_TT_ALIGNED;
+
+   /* TODO: Android, ChromeOS and other applications may need another way to
+    * allocate buffers that can be scanout to display but it should pretty
+    * easy to catch those as Xe KMD driver will print warnings in dmesg when
+    * scanning buffers allocated without proper flag set.
+    */
+   if (wsi_info)
+      alloc_flags |= ANV_BO_ALLOC_SCANOUT;
+
+   /* Anything imported or exported is EXTERNAL */
+   if (mem->vk.export_handle_types || mem->vk.import_handle_type) {
+      alloc_flags |= ANV_BO_ALLOC_EXTERNAL;
+
+      /* wsi has its own way of synchronizing with the compositor */
+      if (!wsi_info && dedicated_info &&
+          dedicated_info->image != VK_NULL_HANDLE) {
+         ANV_FROM_HANDLE(anv_image, image, dedicated_info->image);
+
+         /* Apply implicit sync to be compatible with clients relying on
+          * implicit fencing. This matches the behavior in iris i915_batch
+          * submit. An example client is VA-API (iHD), so only dedicated
+          * image scenario has to be covered.
+          */
+         alloc_flags |= ANV_BO_ALLOC_IMPLICIT_SYNC;
+
+         /* For color attachment, apply IMPLICIT_WRITE so a client on the
+          * consumer side relying on implicit fencing can have a fence to
+          * wait for render complete.
+          */
+         if (image->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+            alloc_flags |= ANV_BO_ALLOC_IMPLICIT_WRITE;
+      }
+   }
 
    if (mem->vk.ahardware_buffer) {
       result = anv_import_ahw_memory(_device, mem);
@@ -4189,6 +4251,8 @@ VkResult anv_AllocateMemory(
    list_addtail(&mem->link, &device->memory_objects);
    pthread_mutex_unlock(&device->mutex);
 
+   ANV_RMV(heap_create, device, mem, false, 0);
+
    *pMem = anv_device_memory_to_handle(mem);
 
    return VK_SUCCESS;
@@ -4293,6 +4357,8 @@ void anv_FreeMemory(
                 -mem->bo->size);
 
    anv_device_release_bo(device, mem->bo);
+
+   ANV_RMV(resource_destroy, device, mem);
 
    vk_device_memory_destroy(&device->vk, pAllocator, &mem->vk);
 }
@@ -4461,13 +4527,17 @@ void anv_GetDeviceMemoryCommitment(
 }
 
 static void
-anv_bind_buffer_memory(const VkBindBufferMemoryInfo *pBindInfo)
+anv_bind_buffer_memory(struct anv_device *device,
+                       const VkBindBufferMemoryInfo *pBindInfo)
 {
    ANV_FROM_HANDLE(anv_device_memory, mem, pBindInfo->memory);
    ANV_FROM_HANDLE(anv_buffer, buffer, pBindInfo->buffer);
 
    assert(pBindInfo->sType == VK_STRUCTURE_TYPE_BIND_BUFFER_MEMORY_INFO);
    assert(!anv_buffer_is_sparse(buffer));
+
+   const VkBindMemoryStatusKHR *bind_status =
+      vk_find_struct_const(pBindInfo->pNext, BIND_MEMORY_STATUS_KHR);
 
    if (mem) {
       assert(pBindInfo->memoryOffset < mem->vk.size);
@@ -4479,15 +4549,22 @@ anv_bind_buffer_memory(const VkBindBufferMemoryInfo *pBindInfo)
    } else {
       buffer->address = ANV_NULL_ADDRESS;
    }
+
+   ANV_RMV(buffer_bind, device, buffer);
+
+   if (bind_status)
+      *bind_status->pResult = VK_SUCCESS;
 }
 
 VkResult anv_BindBufferMemory2(
-    VkDevice                                    device,
+    VkDevice                                    _device,
     uint32_t                                    bindInfoCount,
     const VkBindBufferMemoryInfo*               pBindInfos)
 {
+   ANV_FROM_HANDLE(anv_device, device, _device);
+
    for (uint32_t i = 0; i < bindInfoCount; i++)
-      anv_bind_buffer_memory(&pBindInfos[i]);
+      anv_bind_buffer_memory(device, &pBindInfos[i]);
 
    return VK_SUCCESS;
 }
@@ -4514,6 +4591,8 @@ VkResult anv_CreateEvent(
                                        sizeof(uint64_t), 8);
    *(uint64_t *)event->state.map = VK_EVENT_RESET;
 
+   ANV_RMV(event_create, device, event, pCreateInfo->flags, false);
+
    *pEvent = anv_event_to_handle(event);
 
    return VK_SUCCESS;
@@ -4529,6 +4608,8 @@ void anv_DestroyEvent(
 
    if (!event)
       return;
+
+   ANV_RMV(resource_destroy, device, event);
 
    anv_state_pool_free(&device->dynamic_state_pool, event->state);
 
@@ -4727,6 +4808,8 @@ VkResult anv_CreateBuffer(
       }
    }
 
+   ANV_RMV(buffer_create, device, false, buffer);
+
    *pBuffer = anv_buffer_to_handle(buffer);
 
    return VK_SUCCESS;
@@ -4742,6 +4825,8 @@ void anv_DestroyBuffer(
 
    if (!buffer)
       return;
+
+   ANV_RMV(buffer_destroy, device, buffer);
 
    if (anv_buffer_is_sparse(buffer)) {
       assert(buffer->address.offset == buffer->sparse_data.address);
@@ -5107,6 +5192,9 @@ const struct intel_device_info_pat_entry *
 anv_device_get_pat_entry(struct anv_device *device,
                          enum anv_bo_alloc_flags alloc_flags)
 {
+   if (alloc_flags & ANV_BO_ALLOC_IMPORTED)
+      return &device->info->pat.cached_coherent;
+
    /* PAT indexes has no actual effect in DG2 and DG1, smem caches will always
     * be snopped by GPU and lmem will always be WC.
     * This might change in future discrete platforms.
@@ -5125,4 +5213,104 @@ anv_device_get_pat_entry(struct anv_device *device,
       return &device->info->pat.writeback_incoherent;
    else
       return &device->info->pat.writecombining;
+}
+
+static VkComponentTypeKHR
+convert_component_type(enum intel_cooperative_matrix_component_type t)
+{
+   switch (t) {
+   case INTEL_CMAT_FLOAT16: return VK_COMPONENT_TYPE_FLOAT16_KHR;
+   case INTEL_CMAT_FLOAT32: return VK_COMPONENT_TYPE_FLOAT32_KHR;
+   case INTEL_CMAT_SINT32:  return VK_COMPONENT_TYPE_SINT32_KHR;
+   case INTEL_CMAT_SINT8:   return VK_COMPONENT_TYPE_SINT8_KHR;
+   case INTEL_CMAT_UINT32:  return VK_COMPONENT_TYPE_UINT32_KHR;
+   case INTEL_CMAT_UINT8:   return VK_COMPONENT_TYPE_UINT8_KHR;
+   }
+   unreachable("invalid cooperative matrix component type in configuration");
+}
+
+static VkScopeKHR
+convert_scope(enum intel_cmat_scope scope)
+{
+   switch (scope) {
+   case INTEL_CMAT_SCOPE_SUBGROUP: return VK_SCOPE_SUBGROUP_KHR;
+   default:
+      unreachable("invalid cooperative matrix scope in configuration");
+   }
+}
+
+VkResult anv_GetPhysicalDeviceCooperativeMatrixPropertiesKHR(
+   VkPhysicalDevice                            physicalDevice,
+   uint32_t*                                   pPropertyCount,
+   VkCooperativeMatrixPropertiesKHR*           pProperties)
+{
+   ANV_FROM_HANDLE(anv_physical_device, pdevice, physicalDevice);
+   const struct intel_device_info *devinfo = &pdevice->info;
+
+   assert(anv_has_cooperative_matrix(pdevice));
+
+   VK_OUTARRAY_MAKE_TYPED(VkCooperativeMatrixPropertiesKHR, out, pProperties, pPropertyCount);
+
+   for (int i = 0; i < ARRAY_SIZE(devinfo->cooperative_matrix_configurations); i++) {
+      const struct intel_cooperative_matrix_configuration *cfg =
+         &devinfo->cooperative_matrix_configurations[i];
+
+      if (cfg->scope == INTEL_CMAT_SCOPE_NONE)
+         break;
+
+      vk_outarray_append_typed(VkCooperativeMatrixPropertiesKHR, &out, prop) {
+         prop->sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+
+         prop->MSize = cfg->m;
+         prop->NSize = cfg->n;
+         prop->KSize = cfg->k;
+
+         prop->AType      = convert_component_type(cfg->a);
+         prop->BType      = convert_component_type(cfg->b);
+         prop->CType      = convert_component_type(cfg->c);
+         prop->ResultType = convert_component_type(cfg->result);
+
+         prop->saturatingAccumulation = VK_FALSE;
+         prop->scope = convert_scope(cfg->scope);
+      }
+
+      /* VUID-RuntimeSpirv-saturatingAccumulation-08983 says:
+       *
+       *    For OpCooperativeMatrixMulAddKHR, the SaturatingAccumulation
+       *    cooperative matrix operand must be present if and only if
+       *    VkCooperativeMatrixPropertiesKHR::saturatingAccumulation is
+       *    VK_TRUE.
+       *
+       * As a result, we have to advertise integer configs both with and
+       * without this flag set.
+       *
+       * The DPAS instruction does not support the .sat modifier, so only
+       * advertise the configurations when the DPAS would be lowered.
+       *
+       * FINISHME: It should be possible to do better than full lowering on
+       * platforms that support DPAS. Emit a DPAS with a NULL accumulator
+       * argument, then perform the correct sequence of saturating add
+       * instructions.
+       */
+      if (cfg->a != INTEL_CMAT_FLOAT16 &&
+          (devinfo->verx10 < 125 || debug_get_bool_option("INTEL_LOWER_DPAS", false))) {
+         vk_outarray_append_typed(VkCooperativeMatrixPropertiesKHR, &out, prop) {
+            prop->sType = VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+
+            prop->MSize = cfg->m;
+            prop->NSize = cfg->n;
+            prop->KSize = cfg->k;
+
+            prop->AType      = convert_component_type(cfg->a);
+            prop->BType      = convert_component_type(cfg->b);
+            prop->CType      = convert_component_type(cfg->c);
+            prop->ResultType = convert_component_type(cfg->result);
+
+            prop->saturatingAccumulation = VK_TRUE;
+            prop->scope = convert_scope(cfg->scope);
+         }
+      }
+   }
+
+   return vk_outarray_status(&out);
 }

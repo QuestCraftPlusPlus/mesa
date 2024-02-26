@@ -28,8 +28,8 @@
 #ifndef NIR_H
 #define NIR_H
 
+#include "compiler/glsl_types.h"
 #include "compiler/glsl/list.h"
-#include "compiler/nir_types.h"
 #include "compiler/shader_enums.h"
 #include "compiler/shader_info.h"
 #include "util/bitscan.h"
@@ -1668,6 +1668,12 @@ typedef struct {
    nir_def def;
 } nir_deref_instr;
 
+/**
+ * Returns true if the cast is trivial, i.e. the source and destination type is
+ * the same.
+ */
+bool nir_deref_cast_is_trivial(nir_deref_instr *cast);
+
 /** Returns true if deref might have one of the given modes
  *
  * For multi-mode derefs, this returns true if any of the possible modes for
@@ -2262,6 +2268,15 @@ typedef enum nir_tex_src_type {
 
    /** Second backend-specific vec4 tex src argument, see nir_tex_src_backend1. */
    nir_tex_src_backend2,
+
+   /**
+    * Backend-specific parameter that combines LOD parameter and array index.
+    *
+    * If this parameter is present, then nir_tex_src_lod and nir_tex_src_bias
+    * must not be present.  Also vice versa.  Only valid if nir_tex_instr::op
+    * is nir_texop_txl or nir_texop_txb and nir_tex_instr::is_array is set.
+    */
+   nir_tex_src_combined_lod_and_array_index_intel,
 
    nir_num_tex_src_types
 } nir_tex_src_type;
@@ -3523,7 +3538,9 @@ typedef enum {
    nir_lower_dsub = (1 << 9),
    nir_lower_ddiv = (1 << 10),
    nir_lower_dsign = (1 << 11),
-   nir_lower_fp64_full_software = (1 << 12),
+   nir_lower_dminmax = (1 << 12),
+   nir_lower_dsat = (1 << 13),
+   nir_lower_fp64_full_software = (1 << 14),
 } nir_lower_doubles_options;
 
 typedef enum {
@@ -3836,8 +3853,10 @@ typedef struct nir_shader_compiler_options {
    /* Lowers when 32x32->64 bit multiplication is not supported */
    bool lower_mul_2x32_64;
 
-   /* Lowers when rotate instruction is not supported */
-   bool lower_rotate;
+   /* Indicates that urol and uror are supported */
+   bool has_rotate8;
+   bool has_rotate16;
+   bool has_rotate32;
 
    /** Backend supports ternary addition */
    bool has_iadd3;
@@ -3929,6 +3948,9 @@ typedef struct nir_shader_compiler_options {
 
    /** Backend supports uclz. */
    bool has_uclz;
+
+   /** Backend support msad_u4x8. */
+   bool has_msad;
 
    /**
     * Is this the Intel vec4 backend?
@@ -5124,7 +5146,7 @@ bool nir_lower_indirect_var_derefs(nir_shader *shader,
 
 bool nir_lower_locals_to_regs(nir_shader *shader, uint8_t bool_bitsize);
 
-void nir_lower_io_to_temporaries(nir_shader *shader,
+bool nir_lower_io_to_temporaries(nir_shader *shader,
                                  nir_function_impl *entrypoint,
                                  bool outputs, bool inputs);
 
@@ -5543,11 +5565,14 @@ bool nir_lower_variable_initializers(nir_shader *shader,
 bool nir_zero_initialize_shared_memory(nir_shader *shader,
                                        const unsigned shared_size,
                                        const unsigned chunk_size);
+bool nir_clear_shared_memory(nir_shader *shader,
+                             const unsigned shared_size,
+                             const unsigned chunk_size);
 
 bool nir_move_vec_src_uses_to_dest(nir_shader *shader, bool skip_const_srcs);
 bool nir_lower_vec_to_regs(nir_shader *shader, nir_instr_writemask_filter_cb cb,
                            const void *_data);
-void nir_lower_alpha_test(nir_shader *shader, enum compare_func func,
+bool nir_lower_alpha_test(nir_shader *shader, enum compare_func func,
                           bool alpha_to_one,
                           const gl_state_index16 *alpha_ref_state_tokens);
 bool nir_lower_alu(nir_shader *shader);
@@ -5575,7 +5600,7 @@ bool nir_lower_load_const_to_scalar(nir_shader *shader);
 bool nir_lower_read_invocation_to_scalar(nir_shader *shader);
 bool nir_lower_phis_to_scalar(nir_shader *shader, bool lower_all);
 void nir_lower_io_arrays_to_elements(nir_shader *producer, nir_shader *consumer);
-void nir_lower_io_arrays_to_elements_no_indirects(nir_shader *shader,
+bool nir_lower_io_arrays_to_elements_no_indirects(nir_shader *shader,
                                                   bool outputs_only);
 bool nir_lower_io_to_scalar(nir_shader *shader, nir_variable_mode mask, nir_instr_filter_cb filter, void *filter_data);
 bool nir_lower_io_to_scalar_early(nir_shader *shader, nir_variable_mode mask);
@@ -5627,6 +5652,7 @@ typedef struct nir_lower_subgroups_options {
    bool lower_ballot_bit_count_to_mbcnt_amd : 1;
    bool lower_inverse_ballot : 1;
    bool lower_boolean_reduce : 1;
+   bool lower_boolean_shuffle : 1;
 } nir_lower_subgroups_options;
 
 bool nir_lower_subgroups(nir_shader *shader,
@@ -5907,6 +5933,12 @@ typedef struct nir_lower_tex_options {
    bool lower_index_to_offset;
 
    /**
+    * If true, pack either the explicit LOD or LOD bias and the array index
+    * into a single (32-bit) value when 32-bit texture coordinates are used.
+    */
+   bool pack_lod_and_array_index;
+
+   /**
     * Payload data to be sent to callback / filter functions.
     */
    void *callback_data;
@@ -6006,11 +6038,11 @@ bool nir_lower_clip_gs(nir_shader *shader, unsigned ucp_enables,
 bool nir_lower_clip_fs(nir_shader *shader, unsigned ucp_enables,
                        bool use_clipdist_array);
 
-void nir_lower_clip_cull_distance_to_vec4s(nir_shader *shader);
+bool nir_lower_clip_cull_distance_to_vec4s(nir_shader *shader);
 bool nir_lower_clip_cull_distance_arrays(nir_shader *nir);
 bool nir_lower_clip_disable(nir_shader *shader, unsigned clip_plane_enable);
 
-void nir_lower_point_size_mov(nir_shader *shader,
+bool nir_lower_point_size_mov(nir_shader *shader,
                               const gl_state_index16 *pointsize_state_tokens);
 
 bool nir_lower_frexp(nir_shader *nir);
@@ -6021,7 +6053,7 @@ bool nir_lower_clamp_color_outputs(nir_shader *shader);
 
 bool nir_lower_flatshade(nir_shader *shader);
 
-void nir_lower_passthrough_edgeflags(nir_shader *shader);
+bool nir_lower_passthrough_edgeflags(nir_shader *shader);
 bool nir_lower_patch_vertices(nir_shader *nir, unsigned static_count,
                               const gl_state_index16 *uniform_state_tokens);
 
@@ -6054,7 +6086,7 @@ typedef struct nir_lower_drawpixels_options {
    bool scale_and_bias : 1;
 } nir_lower_drawpixels_options;
 
-void nir_lower_drawpixels(nir_shader *shader,
+bool nir_lower_drawpixels(nir_shader *shader,
                           const nir_lower_drawpixels_options *options);
 
 typedef struct nir_lower_bitmap_options {
@@ -6062,7 +6094,7 @@ typedef struct nir_lower_bitmap_options {
    bool swizzle_xxxx;
 } nir_lower_bitmap_options;
 
-void nir_lower_bitmap(nir_shader *shader, const nir_lower_bitmap_options *options);
+bool nir_lower_bitmap(nir_shader *shader, const nir_lower_bitmap_options *options);
 
 bool nir_lower_atomics_to_ssbo(nir_shader *shader, unsigned offset_align_state);
 
@@ -6235,7 +6267,6 @@ bool nir_lower_ssbo(nir_shader *shader);
 bool nir_lower_helper_writes(nir_shader *shader, bool lower_plain_stores);
 
 typedef struct nir_lower_printf_options {
-   bool treat_doubles_as_floats : 1;
    unsigned max_buffer_size;
 } nir_lower_printf_options;
 
@@ -6296,9 +6327,8 @@ bool nir_opt_gcm(nir_shader *shader, bool value_number);
 bool nir_opt_idiv_const(nir_shader *shader, unsigned min_bit_size);
 
 typedef enum {
-   nir_opt_if_aggressive_last_continue = (1 << 0),
-   nir_opt_if_optimize_phi_true_false = (1 << 1),
-   nir_opt_if_avoid_64bit_phis = (1 << 2),
+   nir_opt_if_optimize_phi_true_false = (1 << 0),
+   nir_opt_if_avoid_64bit_phis = (1 << 1),
 } nir_opt_if_options;
 
 bool nir_opt_if(nir_shader *shader, nir_opt_if_options options);
@@ -6308,6 +6338,8 @@ bool nir_opt_intrinsics(nir_shader *shader);
 bool nir_opt_large_constants(nir_shader *shader,
                              glsl_type_size_align_func size_align,
                              unsigned threshold);
+
+bool nir_opt_loop(nir_shader *shader);
 
 bool nir_opt_loop_unroll(nir_shader *shader);
 
@@ -6359,8 +6391,6 @@ bool nir_opt_phi_precision(nir_shader *shader);
 bool nir_opt_shrink_stores(nir_shader *shader, bool shrink_image_store);
 
 bool nir_opt_shrink_vectors(nir_shader *shader);
-
-bool nir_opt_trivial_continues(nir_shader *shader);
 
 bool nir_opt_undef(nir_shader *shader);
 
@@ -6513,6 +6543,9 @@ nir_remove_tex_shadow(nir_shader *shader, unsigned textures_bitmask);
 void
 nir_trivialize_registers(nir_shader *s);
 
+unsigned
+nir_static_workgroup_size(const nir_shader *s);
+
 static inline nir_intrinsic_instr *
 nir_reg_get_decl(nir_def *reg)
 {
@@ -6554,6 +6587,18 @@ nir_next_decl_reg(nir_intrinsic_instr *prev, nir_function_impl *impl)
    for (nir_intrinsic_instr *reg = nir_next_decl_reg(NULL, impl),  \
                             *next_ = nir_next_decl_reg(reg, NULL); \
         reg; reg = next_, next_ = nir_next_decl_reg(next_, NULL))
+
+static inline nir_cursor
+nir_after_reg_decls(nir_function_impl *impl)
+{
+   nir_intrinsic_instr *last_reg_decl = NULL;
+   nir_foreach_reg_decl(reg_decl, impl)
+      last_reg_decl = reg_decl;
+
+   if (last_reg_decl != NULL)
+      return nir_after_instr(&last_reg_decl->instr);
+   return nir_before_impl(impl);
+}
 
 static inline bool
 nir_is_load_reg(nir_intrinsic_instr *intr)

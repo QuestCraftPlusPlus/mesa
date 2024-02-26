@@ -185,6 +185,7 @@ genX(emit_vertex_input)(struct anv_batch *batch,
                                                   vi->attributes[a].format,
                                                   VK_IMAGE_ASPECT_COLOR_BIT,
                                                   VK_IMAGE_TILING_LINEAR);
+      assume(format < ISL_NUM_FORMATS);
 
       uint32_t binding = vi->attributes[a].binding;
       assert(binding < MAX_VBS);
@@ -1183,8 +1184,10 @@ emit_3dstate_vs(struct anv_graphics_pipeline *pipeline)
       vs.Enable               = true;
       vs.StatisticsEnable     = true;
       vs.KernelStartPointer   = vs_bin->kernel.offset;
+#if GFX_VER < 20
       vs.SIMD8DispatchEnable  =
          vs_prog_data->base.dispatch_mode == DISPATCH_MODE_SIMD8;
+#endif
 
       assert(!vs_prog_data->base.base.use_alt_mode);
 #if GFX_VER < 11
@@ -1312,7 +1315,9 @@ emit_3dstate_hs_ds(struct anv_graphics_pipeline *pipeline,
       hs.PatchCountThreshold = tcs_prog_data->patch_count_threshold;
 #endif
 
+#if GFX_VER < 20
       hs.DispatchMode = tcs_prog_data->base.dispatch_mode;
+#endif
       hs.IncludePrimitiveID = tcs_prog_data->include_primitive_id;
    };
 
@@ -1443,7 +1448,9 @@ emit_3dstate_gs(struct anv_graphics_pipeline *pipeline)
       gs.Enable                  = true;
       gs.StatisticsEnable        = true;
       gs.KernelStartPointer      = gs_bin->kernel.offset;
+#if GFX_VER < 20
       gs.DispatchMode            = gs_prog_data->base.dispatch_mode;
+#endif
 
       gs.SingleProgramFlow       = false;
       gs.VectorMaskEnable        = false;
@@ -1485,13 +1492,6 @@ emit_3dstate_gs(struct anv_graphics_pipeline *pipeline)
          get_scratch_address(&pipeline->base.base, MESA_SHADER_GEOMETRY, gs_bin);
 #endif
    }
-}
-
-static bool
-state_has_ds_self_dep(const struct vk_graphics_pipeline_state *state)
-{
-   return state->pipeline_flags &
-      VK_PIPELINE_CREATE_2_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
 }
 
 static void
@@ -1571,20 +1571,36 @@ emit_3dstate_ps(struct anv_graphics_pipeline *pipeline,
       const bool persample =
          brw_wm_prog_data_is_persample(wm_prog_data, pipeline->fs_msaa_flags);
 
+#if GFX_VER == 12
+      assert(wm_prog_data->dispatch_multi == 0 ||
+             (wm_prog_data->dispatch_multi == 16 && wm_prog_data->max_polygons == 2));
+      ps.DualSIMD8DispatchEnable = wm_prog_data->dispatch_multi;
+      /* XXX - No major improvement observed from enabling
+       *       overlapping subspans, but it could be helpful
+       *       in theory when the requirements listed on the
+       *       BSpec page for 3DSTATE_PS_BODY are met.
+       */
+      ps.OverlappingSubspansEnable = false;
+#endif
+
       ps.KernelStartPointer0 = fs_bin->kernel.offset +
                                brw_wm_prog_data_prog_offset(wm_prog_data, ps, 0);
       ps.KernelStartPointer1 = fs_bin->kernel.offset +
                                brw_wm_prog_data_prog_offset(wm_prog_data, ps, 1);
+#if GFX_VER < 20
       ps.KernelStartPointer2 = fs_bin->kernel.offset +
                                brw_wm_prog_data_prog_offset(wm_prog_data, ps, 2);
+#endif
 
       ps.SingleProgramFlow          = false;
       ps.VectorMaskEnable           = wm_prog_data->uses_vmask;
       /* Wa_1606682166 */
       ps.SamplerCount               = GFX_VER == 11 ? 0 : get_sampler_count(fs_bin);
       ps.BindingTableEntryCount     = fs_bin->bind_map.surface_count;
+#if GFX_VER < 20
       ps.PushConstantEnable         = wm_prog_data->base.nr_params > 0 ||
                                       wm_prog_data->base.ubo_ranges[0].length;
+#endif
       ps.PositionXYOffsetSelect     =
            !wm_prog_data->uses_pos_offset ? POSOFFSET_NONE :
            persample ? POSOFFSET_SAMPLE : POSOFFSET_CENTROID;
@@ -1595,8 +1611,10 @@ emit_3dstate_ps(struct anv_graphics_pipeline *pipeline,
          brw_wm_prog_data_dispatch_grf_start_reg(wm_prog_data, ps, 0);
       ps.DispatchGRFStartRegisterForConstantSetupData1 =
          brw_wm_prog_data_dispatch_grf_start_reg(wm_prog_data, ps, 1);
+#if GFX_VER < 20
       ps.DispatchGRFStartRegisterForConstantSetupData2 =
          brw_wm_prog_data_dispatch_grf_start_reg(wm_prog_data, ps, 2);
+#endif
 
 #if GFX_VERx10 >= 125
       ps.ScratchSpaceBuffer =
@@ -1617,13 +1635,15 @@ emit_3dstate_ps_extra(struct anv_graphics_pipeline *pipeline,
    const struct brw_wm_prog_data *wm_prog_data = get_wm_prog_data(pipeline);
 
    if (!anv_pipeline_has_stage(pipeline, MESA_SHADER_FRAGMENT)) {
-      anv_pipeline_emit(pipeline, final.ps_extra, GENX(3DSTATE_PS_EXTRA), ps);
+      anv_pipeline_emit(pipeline, partial.ps_extra, GENX(3DSTATE_PS_EXTRA), ps);
       return;
    }
 
-   anv_pipeline_emit(pipeline, final.ps_extra, GENX(3DSTATE_PS_EXTRA), ps) {
+   anv_pipeline_emit(pipeline, partial.ps_extra, GENX(3DSTATE_PS_EXTRA), ps) {
       ps.PixelShaderValid              = true;
+#if GFX_VER < 20
       ps.AttributeEnable               = wm_prog_data->num_varying_inputs > 0;
+#endif
       ps.oMaskPresenttoRenderTarget    = wm_prog_data->uses_omask;
       ps.PixelShaderIsPerSample        =
          brw_wm_prog_data_is_persample(wm_prog_data, pipeline->fs_msaa_flags);
@@ -1631,17 +1651,12 @@ emit_3dstate_ps_extra(struct anv_graphics_pipeline *pipeline,
       ps.PixelShaderUsesSourceDepth    = wm_prog_data->uses_src_depth;
       ps.PixelShaderUsesSourceW        = wm_prog_data->uses_src_w;
 
-      /* If the subpass has a depth or stencil self-dependency, then we need
-       * to force the hardware to do the depth/stencil write *after* fragment
-       * shader execution.  Otherwise, the writes may hit memory before we get
-       * around to fetching from the input attachment and we may get the depth
-       * or stencil value from the current draw rather than the previous one.
-       */
-      ps.PixelShaderKillsPixel         = state_has_ds_self_dep(state) ||
-                                         wm_prog_data->uses_kill;
-
       ps.PixelShaderComputesStencil = wm_prog_data->computed_stencil;
+#if GFX_VER >= 20
+      assert(!wm_prog_data->pulls_bary);
+#else
       ps.PixelShaderPullsBary    = wm_prog_data->pulls_bary;
+#endif
 
       ps.InputCoverageMaskState = ICMS_NONE;
       assert(!wm_prog_data->inner_coverage); /* Not available in SPIR-V */
@@ -1705,8 +1720,11 @@ compute_kill_pixel(struct anv_graphics_pipeline *pipeline,
     * 3DSTATE_PS_BLEND::AlphaTestEnable since Vulkan doesn't have a concept
     * of an alpha test.
     */
+   pipeline->rp_has_ds_self_dep =
+      (state->pipeline_flags &
+       VK_PIPELINE_CREATE_2_DEPTH_STENCIL_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT) != 0;
    pipeline->kill_pixel =
-      state_has_ds_self_dep(state) ||
+      pipeline->rp_has_ds_self_dep ||
       wm_prog_data->uses_kill ||
       wm_prog_data->uses_omask ||
       (ms && ms->alpha_to_coverage_enable);

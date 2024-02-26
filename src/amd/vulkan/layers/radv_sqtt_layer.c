@@ -286,10 +286,13 @@ radv_write_event_with_dims_marker(struct radv_cmd_buffer *cmd_buffer, enum rgp_s
    radv_emit_sqtt_userdata(cmd_buffer, &marker, sizeof(marker) / 4);
 }
 
-static void
+void
 radv_write_user_event_marker(struct radv_cmd_buffer *cmd_buffer, enum rgp_sqtt_marker_user_event_type type,
                              const char *str)
 {
+   if (likely(!cmd_buffer->device->sqtt.bo))
+      return;
+
    if (type == UserEventPop) {
       assert(str == NULL);
       struct rgp_sqtt_marker_user_event marker = {0};
@@ -338,7 +341,7 @@ radv_describe_begin_cmd_buffer(struct radv_cmd_buffer *cmd_buffer)
    if (cmd_buffer->qf == RADV_QUEUE_GENERAL)
       marker.queue_flags |= VK_QUEUE_GRAPHICS_BIT;
 
-   if (cmd_buffer->device->instance->legacy_sparse_binding)
+   if (cmd_buffer->device->instance->drirc.legacy_sparse_binding)
       marker.queue_flags |= VK_QUEUE_SPARSE_BINDING_BIT;
 
    radv_emit_sqtt_userdata(cmd_buffer, &marker, sizeof(marker) / 4);
@@ -519,6 +522,23 @@ radv_describe_layout_transition(struct radv_cmd_buffer *cmd_buffer, const struct
    radv_emit_sqtt_userdata(cmd_buffer, &marker, sizeof(marker) / 4);
 
    cmd_buffer->state.num_layout_transitions++;
+}
+
+void
+radv_describe_begin_accel_struct_build(struct radv_cmd_buffer *cmd_buffer, uint32_t count)
+{
+   if (likely(!cmd_buffer->device->sqtt.bo))
+      return;
+
+   char marker[64];
+   snprintf(marker, sizeof(marker), "vkCmdBuildAccelerationStructuresKHR(%u)", count);
+   radv_write_user_event_marker(cmd_buffer, UserEventPush, marker);
+}
+
+void
+radv_describe_end_accel_struct_build(struct radv_cmd_buffer *cmd_buffer)
+{
+   radv_write_user_event_marker(cmd_buffer, UserEventPop, NULL);
 }
 
 static void
@@ -1041,20 +1061,6 @@ sqtt_CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer, VkQueryPool queryPoo
 #define EVENT_RT_MARKER_ALIAS(cmd_name, event_name, flags, ...)                                                        \
    EVENT_MARKER_BASE(cmd_name, Dispatch, event_name | flags, __VA_ARGS__);
 
-static uint32_t
-radv_get_ray_tracing_type(VkCommandBuffer commandBuffer)
-{
-   RADV_FROM_HANDLE(radv_cmd_buffer, cmd_buffer, commandBuffer);
-
-   struct radv_ray_tracing_pipeline *pipeline = cmd_buffer->state.rt_pipeline;
-
-   bool monolithic = true;
-   for (uint32_t i = 0; i < pipeline->stage_count; i++)
-      monolithic &= pipeline->stages[i].can_inline;
-
-   return monolithic ? 0 : ApiRayTracingSeparateCompiled;
-}
-
 VKAPI_ATTR void VKAPI_CALL
 sqtt_CmdTraceRaysKHR(VkCommandBuffer commandBuffer, const VkStridedDeviceAddressRegionKHR *pRaygenShaderBindingTable,
                      const VkStridedDeviceAddressRegionKHR *pMissShaderBindingTable,
@@ -1062,7 +1068,7 @@ sqtt_CmdTraceRaysKHR(VkCommandBuffer commandBuffer, const VkStridedDeviceAddress
                      const VkStridedDeviceAddressRegionKHR *pCallableShaderBindingTable, uint32_t width,
                      uint32_t height, uint32_t depth)
 {
-   EVENT_RT_MARKER(TraceRaysKHR, radv_get_ray_tracing_type(commandBuffer), commandBuffer, pRaygenShaderBindingTable,
+   EVENT_RT_MARKER(TraceRaysKHR, ApiRayTracingSeparateCompiled, commandBuffer, pRaygenShaderBindingTable,
                    pMissShaderBindingTable, pHitShaderBindingTable, pCallableShaderBindingTable, width, height, depth);
 }
 
@@ -1074,24 +1080,15 @@ sqtt_CmdTraceRaysIndirectKHR(VkCommandBuffer commandBuffer,
                              const VkStridedDeviceAddressRegionKHR *pCallableShaderBindingTable,
                              VkDeviceAddress indirectDeviceAddress)
 {
-   EVENT_RT_MARKER(TraceRaysIndirectKHR, radv_get_ray_tracing_type(commandBuffer), commandBuffer,
-                   pRaygenShaderBindingTable, pMissShaderBindingTable, pHitShaderBindingTable,
-                   pCallableShaderBindingTable, indirectDeviceAddress);
+   EVENT_RT_MARKER(TraceRaysIndirectKHR, ApiRayTracingSeparateCompiled, commandBuffer, pRaygenShaderBindingTable,
+                   pMissShaderBindingTable, pHitShaderBindingTable, pCallableShaderBindingTable, indirectDeviceAddress);
 }
 
 VKAPI_ATTR void VKAPI_CALL
 sqtt_CmdTraceRaysIndirect2KHR(VkCommandBuffer commandBuffer, VkDeviceAddress indirectDeviceAddress)
 {
-   EVENT_RT_MARKER_ALIAS(TraceRaysIndirect2KHR, TraceRaysIndirectKHR, radv_get_ray_tracing_type(commandBuffer),
-                         commandBuffer, indirectDeviceAddress);
-}
-
-VKAPI_ATTR void VKAPI_CALL
-sqtt_CmdBuildAccelerationStructuresKHR(VkCommandBuffer commandBuffer, uint32_t infoCount,
-                                       const VkAccelerationStructureBuildGeometryInfoKHR *pInfos,
-                                       const VkAccelerationStructureBuildRangeInfoKHR *const *ppBuildRangeInfos)
-{
-   EVENT_RT_MARKER(BuildAccelerationStructuresKHR, 0, commandBuffer, infoCount, pInfos, ppBuildRangeInfos);
+   EVENT_RT_MARKER_ALIAS(TraceRaysIndirect2KHR, TraceRaysIndirectKHR, ApiRayTracingSeparateCompiled, commandBuffer,
+                         indirectDeviceAddress);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -1562,17 +1559,15 @@ radv_register_rt_pipeline(struct radv_device *device, struct radv_ray_tracing_pi
 
    for (unsigned i = 0; i < pipeline->stage_count; i++) {
       struct radv_ray_tracing_stage *stage = &pipeline->stages[i];
-      if (!radv_ray_tracing_stage_is_compiled(stage)) {
-         if (stage->stage == MESA_SHADER_ANY_HIT)
-            max_any_hit_stack_size = MAX2(max_any_hit_stack_size, stage->stack_size);
-         else if (stage->stage == MESA_SHADER_INTERSECTION)
-            max_intersection_stack_size = MAX2(max_intersection_stack_size, stage->stack_size);
-         else
-            unreachable("invalid non-compiled stage");
+      if (stage->stage == MESA_SHADER_ANY_HIT)
+         max_any_hit_stack_size = MAX2(max_any_hit_stack_size, stage->stack_size);
+      else if (stage->stage == MESA_SHADER_INTERSECTION)
+         max_intersection_stack_size = MAX2(max_intersection_stack_size, stage->stack_size);
+
+      if (!pipeline->stages[i].shader)
          continue;
-      }
-      struct radv_shader *shader = container_of(pipeline->stages[i].shader, struct radv_shader, base);
-      result = radv_register_rt_stage(device, pipeline, i, stage->stack_size, shader);
+
+      result = radv_register_rt_stage(device, pipeline, i, stage->stack_size, stage->shader);
       if (result != VK_SUCCESS)
          return result;
    }
@@ -1580,10 +1575,12 @@ radv_register_rt_pipeline(struct radv_device *device, struct radv_ray_tracing_pi
    uint32_t idx = pipeline->stage_count;
 
    /* Combined traversal shader */
-   result = radv_register_rt_stage(device, pipeline, idx++, max_any_hit_stack_size + max_intersection_stack_size,
-                                   pipeline->base.base.shaders[MESA_SHADER_INTERSECTION]);
-   if (result != VK_SUCCESS)
-      return result;
+   if (pipeline->base.base.shaders[MESA_SHADER_INTERSECTION]) {
+      result = radv_register_rt_stage(device, pipeline, idx++, max_any_hit_stack_size + max_intersection_stack_size,
+                                      pipeline->base.base.shaders[MESA_SHADER_INTERSECTION]);
+      if (result != VK_SUCCESS)
+         return result;
+   }
 
    /* Prolog */
    result = radv_register_rt_stage(device, pipeline, idx++, 0, pipeline->prolog);

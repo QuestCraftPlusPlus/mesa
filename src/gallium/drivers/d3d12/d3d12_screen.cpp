@@ -68,6 +68,7 @@ d3d12_debug_options[] = {
    { "res",          D3D12_DEBUG_RESOURCE,      "Debug resources" },
    { "debuglayer",   D3D12_DEBUG_DEBUG_LAYER,   "Enable debug layer" },
    { "gpuvalidator", D3D12_DEBUG_GPU_VALIDATOR, "Enable GPU validator" },
+   { "singleton",    D3D12_DEBUG_SINGLETON,     "Disallow use of device factory" },
    DEBUG_NAMED_VALUE_END
 };
 
@@ -765,10 +766,6 @@ d3d12_deinit_screen(struct d3d12_screen *screen)
       screen->dev->Release();
       screen->dev = nullptr;
    }
-   if (screen->winsys) {
-      screen->winsys->destroy(screen->winsys);
-      screen->winsys = nullptr;
-   }
 }
 
 void
@@ -1385,6 +1382,7 @@ try_find_d3d12core_next_to_self(char *path, size_t path_arr_size)
       return nullptr;
    }
 
+   *(last_slash + 1) = '\0';
    return path;
 }
 #endif
@@ -1393,6 +1391,9 @@ try_find_d3d12core_next_to_self(char *path, size_t path_arr_size)
 static ID3D12DeviceFactory *
 try_create_device_factory(util_dl_library *d3d12_mod)
 {
+   if (d3d12_debug & D3D12_DEBUG_SINGLETON)
+      return nullptr;
+
    /* A device factory allows us to isolate things like debug layer enablement from other callers,
     * and can potentially even refer to a different D3D12 redist implementation from others.
     */
@@ -1561,6 +1562,7 @@ d3d12_init_screen(struct d3d12_screen *screen, IUnknown *adapter)
    screen->max_feature_level = feature_levels.MaxSupportedFeatureLevel;
 
    static const D3D_SHADER_MODEL valid_shader_models[] = {
+      D3D_SHADER_MODEL_6_8,
       D3D_SHADER_MODEL_6_7, D3D_SHADER_MODEL_6_6, D3D_SHADER_MODEL_6_5, D3D_SHADER_MODEL_6_4,
       D3D_SHADER_MODEL_6_3, D3D_SHADER_MODEL_6_2, D3D_SHADER_MODEL_6_1, D3D_SHADER_MODEL_6_0,
    };
@@ -1568,7 +1570,7 @@ d3d12_init_screen(struct d3d12_screen *screen, IUnknown *adapter)
       D3D12_FEATURE_DATA_SHADER_MODEL shader_model = { valid_shader_models[i] };
       if (SUCCEEDED(screen->dev->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &shader_model, sizeof(shader_model)))) {
          static_assert(D3D_SHADER_MODEL_6_0 == 0x60 && SHADER_MODEL_6_0 == 0x60000, "Validating math below");
-         static_assert(D3D_SHADER_MODEL_6_7 == 0x67 && SHADER_MODEL_6_7 == 0x60007, "Validating math below");
+         static_assert(D3D_SHADER_MODEL_6_8 == 0x68 && SHADER_MODEL_6_8 == 0x60008, "Validating math below");
          screen->max_shader_model = static_cast<dxil_shader_model>(((shader_model.HighestShaderModel & 0xf0) << 12) |
                                                                    (shader_model.HighestShaderModel & 0xf));
          break;

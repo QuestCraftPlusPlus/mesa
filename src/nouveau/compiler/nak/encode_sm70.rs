@@ -329,52 +329,45 @@ impl SM70Instr {
 
         self.set_alu_reg_src(24..32, 73, 72, &src0);
 
-        let form = match &src1 {
-            ALUSrc::Reg(reg1) => {
-                match &src2 {
-                    ALUSrc::None => {
+        let form = match &src2 {
+            ALUSrc::None | ALUSrc::Reg(_) => {
+                self.set_alu_reg_src(64..72, 74, 75, &src2);
+                match &src1 {
+                    ALUSrc::None => 1_u8, // form
+                    ALUSrc::Reg(reg1) => {
                         self.set_alu_reg(32..40, 62, 63, reg1);
                         1_u8 // form
                     }
-                    ALUSrc::Reg(reg2) => {
-                        self.set_alu_reg(32..40, 62, 63, reg1);
-                        self.set_alu_reg(64..72, 74, 75, reg2);
-                        1_u8 // form
-                    }
-                    ALUSrc::UReg(reg2) => {
-                        self.set_alu_ureg(32..40, 62, 63, reg2);
-                        self.set_alu_reg(64..72, 74, 75, reg1);
-                        7_u8 // form
+                    ALUSrc::UReg(reg1) => {
+                        self.set_alu_ureg(32..40, 62, 63, reg1);
+                        6_u8 // form
                     }
                     ALUSrc::Imm32(imm) => {
-                        self.set_src_imm(32..64, &imm);
-                        self.set_alu_reg(64..72, 74, 75, reg1);
-                        2_u8 // form
+                        self.set_src_imm(32..64, imm);
+                        4_u8 // form
                     }
                     ALUSrc::CBuf(cb) => {
-                        // TODO set_src_cx
                         self.set_alu_cb(38..59, 62, 63, cb);
-                        self.set_alu_reg(64..72, 74, 75, reg1);
-                        3_u8 // form
+                        5_u8 // form
                     }
                 }
             }
-            ALUSrc::UReg(reg1) => {
-                self.set_alu_ureg(32..40, 62, 63, reg1);
-                self.set_alu_reg_src(64..72, 74, 75, &src2);
-                6_u8 // form
+            ALUSrc::UReg(reg2) => {
+                self.set_alu_ureg(32..40, 62, 63, reg2);
+                self.set_alu_reg_src(64..72, 74, 75, &src1);
+                7_u8 // form
             }
             ALUSrc::Imm32(imm) => {
-                self.set_src_imm(32..64, &imm);
-                self.set_alu_reg_src(64..72, 74, 75, &src2);
-                4_u8 // form
+                self.set_src_imm(32..64, imm);
+                self.set_alu_reg_src(64..72, 74, 75, &src1);
+                2_u8 // form
             }
             ALUSrc::CBuf(cb) => {
+                // TODO set_src_cx
                 self.set_alu_cb(38..59, 62, 63, cb);
-                self.set_alu_reg_src(64..72, 74, 75, &src2);
-                5_u8 // form
+                self.set_alu_reg_src(64..72, 74, 75, &src1);
+                3_u8 // form
             }
-            _ => panic!("Invalid instruction form"),
         };
 
         self.set_field(0..9, opcode);
@@ -586,7 +579,83 @@ impl SM70Instr {
         );
     }
 
-    fn encode_brev(&mut self, op: &OpBrev) {
+    fn encode_dadd(&mut self, op: &OpDAdd) {
+        self.encode_alu(
+            0x029,
+            Some(op.dst),
+            ALUSrc::from_src(&op.srcs[0]),
+            ALUSrc::None,
+            ALUSrc::from_src(&op.srcs[1]),
+        );
+        self.set_rnd_mode(78..80, op.rnd_mode);
+    }
+
+    fn encode_dfma(&mut self, op: &OpDFma) {
+        self.encode_alu(
+            0x02b,
+            Some(op.dst),
+            ALUSrc::from_src(&op.srcs[0]),
+            ALUSrc::from_src(&op.srcs[1]),
+            ALUSrc::from_src(&op.srcs[2]),
+        );
+        self.set_rnd_mode(78..80, op.rnd_mode);
+    }
+
+    fn encode_dmul(&mut self, op: &OpDMul) {
+        self.encode_alu(
+            0x028,
+            Some(op.dst),
+            ALUSrc::from_src(&op.srcs[0]),
+            ALUSrc::from_src(&op.srcs[1]),
+            ALUSrc::None,
+        );
+        self.set_rnd_mode(78..80, op.rnd_mode);
+    }
+
+    fn encode_dsetp(&mut self, op: &OpDSetP) {
+        match op.srcs[1].src_ref {
+            SrcRef::Reg(_) | SrcRef::Zero => {
+                self.encode_alu(
+                    0x02a,
+                    None,
+                    ALUSrc::from_src(&op.srcs[0]),
+                    ALUSrc::from_src(&op.srcs[1]),
+                    ALUSrc::None,
+                );
+            }
+            _ => {
+                self.encode_alu(
+                    0x02a,
+                    None,
+                    ALUSrc::from_src(&op.srcs[0]),
+                    ALUSrc::None,
+                    ALUSrc::from_src(&op.srcs[1]),
+                );
+            }
+        }
+
+        self.set_pred_set_op(74..76, op.set_op);
+        self.set_float_cmp_op(76..80, op.cmp_op);
+
+        self.set_pred_dst(81..84, op.dst);
+        self.set_pred_dst(84..87, Dst::None); /* dst1 */
+
+        self.set_pred_src(87..90, 90, op.accum);
+    }
+
+    fn encode_bmsk(&mut self, op: &OpBMsk) {
+        self.encode_alu(
+            0x01b,
+            Some(op.dst),
+            ALUSrc::from_src(&op.pos),
+            ALUSrc::from_src(&op.width),
+            ALUSrc::None,
+        );
+
+        self.set_bit(75, op.wrap);
+    }
+
+    fn encode_brev(&mut self, op: &OpBRev) {
         self.encode_alu(
             0x101,
             Some(op.dst),
@@ -746,8 +815,8 @@ impl SM70Instr {
         self.encode_alu(
             0x00c,
             None,
-            ALUSrc::from_src(&op.srcs[0].into()),
-            ALUSrc::from_src(&op.srcs[1].into()),
+            ALUSrc::from_src(&op.srcs[0]),
+            ALUSrc::from_src(&op.srcs[1]),
             ALUSrc::None,
         );
 
@@ -774,9 +843,9 @@ impl SM70Instr {
         self.encode_alu(
             0x012,
             Some(op.dst),
-            ALUSrc::from_src(&op.srcs[0].into()),
-            ALUSrc::from_src(&op.srcs[1].into()),
-            ALUSrc::from_src(&op.srcs[2].into()),
+            ALUSrc::from_src(&op.srcs[0]),
+            ALUSrc::from_src(&op.srcs[1]),
+            ALUSrc::from_src(&op.srcs[2]),
         );
 
         self.set_field(72..80, op.op.lut);
@@ -823,12 +892,13 @@ impl SM70Instr {
     }
 
     fn encode_f2f(&mut self, op: &OpF2F) {
+        assert!(!op.integer_rnd);
         if op.src_type.bits() <= 32 && op.dst_type.bits() <= 32 {
             self.encode_alu(
                 0x104,
                 Some(op.dst),
                 ALUSrc::None,
-                ALUSrc::from_src(&op.src.into()),
+                ALUSrc::from_src(&op.src),
                 ALUSrc::None,
             );
         } else {
@@ -836,7 +906,7 @@ impl SM70Instr {
                 0x110,
                 Some(op.dst),
                 ALUSrc::None,
-                ALUSrc::from_src(&op.src.into()),
+                ALUSrc::from_src(&op.src),
                 ALUSrc::None,
             );
         }
@@ -857,7 +927,7 @@ impl SM70Instr {
                 0x105,
                 Some(op.dst),
                 ALUSrc::None,
-                ALUSrc::from_src(&op.src.into()),
+                ALUSrc::from_src(&op.src),
                 ALUSrc::None,
             );
         } else {
@@ -865,7 +935,7 @@ impl SM70Instr {
                 0x111,
                 Some(op.dst),
                 ALUSrc::None,
-                ALUSrc::from_src(&op.src.into()),
+                ALUSrc::from_src(&op.src),
                 ALUSrc::None,
             );
         }
@@ -884,7 +954,7 @@ impl SM70Instr {
                 0x106,
                 Some(op.dst),
                 ALUSrc::None,
-                ALUSrc::from_src(&op.src.into()),
+                ALUSrc::from_src(&op.src),
                 ALUSrc::None,
             );
         } else {
@@ -892,7 +962,7 @@ impl SM70Instr {
                 0x112,
                 Some(op.dst),
                 ALUSrc::None,
-                ALUSrc::from_src(&op.src.into()),
+                ALUSrc::from_src(&op.src),
                 ALUSrc::None,
             );
         }
@@ -910,7 +980,7 @@ impl SM70Instr {
                 0x107,
                 Some(op.dst),
                 ALUSrc::None,
-                ALUSrc::from_src(&op.src.into()),
+                ALUSrc::from_src(&op.src),
                 ALUSrc::None,
             );
         } else {
@@ -918,7 +988,7 @@ impl SM70Instr {
                 0x113,
                 Some(op.dst),
                 ALUSrc::None,
-                ALUSrc::from_src(&op.src.into()),
+                ALUSrc::from_src(&op.src),
                 ALUSrc::None,
             );
         }
@@ -934,7 +1004,7 @@ impl SM70Instr {
             0x002,
             Some(op.dst),
             ALUSrc::None,
-            ALUSrc::from_src(&op.src.into()),
+            ALUSrc::from_src(&op.src),
             ALUSrc::None,
         );
         self.set_field(72..76, op.quad_lanes);
@@ -967,8 +1037,8 @@ impl SM70Instr {
         self.encode_alu(
             0x007,
             Some(op.dst),
-            ALUSrc::from_src(&op.srcs[0].into()),
-            ALUSrc::from_src(&op.srcs[1].into()),
+            ALUSrc::from_src(&op.srcs[0]),
+            ALUSrc::from_src(&op.srcs[1]),
             ALUSrc::None,
         );
 
@@ -1925,74 +1995,79 @@ impl SM70Instr {
         };
 
         match &instr.op {
-            Op::FAdd(op) => si.encode_fadd(&op),
-            Op::FFma(op) => si.encode_ffma(&op),
-            Op::FMnMx(op) => si.encode_fmnmx(&op),
-            Op::FMul(op) => si.encode_fmul(&op),
-            Op::FSet(op) => si.encode_fset(&op),
-            Op::FSetP(op) => si.encode_fsetp(&op),
-            Op::FSwzAdd(op) => si.encode_fswzadd(&op),
-            Op::MuFu(op) => si.encode_mufu(&op),
-            Op::Brev(op) => si.encode_brev(&op),
-            Op::Flo(op) => si.encode_flo(&op),
-            Op::IAbs(op) => si.encode_iabs(&op),
-            Op::IAdd3(op) => si.encode_iadd3(&op),
-            Op::IAdd3X(op) => si.encode_iadd3x(&op),
-            Op::IDp4(op) => si.encode_idp4(&op),
-            Op::IMad(op) => si.encode_imad(&op),
-            Op::IMad64(op) => si.encode_imad64(&op),
-            Op::IMnMx(op) => si.encode_imnmx(&op),
-            Op::ISetP(op) => si.encode_isetp(&op),
-            Op::Lop3(op) => si.encode_lop3(&op),
-            Op::PopC(op) => si.encode_popc(&op),
-            Op::Shf(op) => si.encode_shf(&op),
-            Op::F2F(op) => si.encode_f2f(&op),
-            Op::F2I(op) => si.encode_f2i(&op),
-            Op::I2F(op) => si.encode_i2f(&op),
-            Op::FRnd(op) => si.encode_frnd(&op),
-            Op::Mov(op) => si.encode_mov(&op),
-            Op::Prmt(op) => si.encode_prmt(&op),
-            Op::Sel(op) => si.encode_sel(&op),
-            Op::Shfl(op) => si.encode_shfl(&op),
-            Op::PLop3(op) => si.encode_plop3(&op),
-            Op::Tex(op) => si.encode_tex(&op),
-            Op::Tld(op) => si.encode_tld(&op),
-            Op::Tld4(op) => si.encode_tld4(&op),
-            Op::Tmml(op) => si.encode_tmml(&op),
-            Op::Txd(op) => si.encode_txd(&op),
-            Op::Txq(op) => si.encode_txq(&op),
-            Op::SuLd(op) => si.encode_suld(&op),
-            Op::SuSt(op) => si.encode_sust(&op),
-            Op::SuAtom(op) => si.encode_suatom(&op),
-            Op::Ld(op) => si.encode_ld(&op),
-            Op::Ldc(op) => si.encode_ldc(&op),
-            Op::St(op) => si.encode_st(&op),
-            Op::Atom(op) => si.encode_atom(&op),
-            Op::AL2P(op) => si.encode_al2p(&op),
-            Op::ALd(op) => si.encode_ald(&op),
-            Op::ASt(op) => si.encode_ast(&op),
-            Op::Ipa(op) => si.encode_ipa(&op),
-            Op::LdTram(op) => si.encode_ldtram(&op),
-            Op::CCtl(op) => si.encode_cctl(&op),
-            Op::MemBar(op) => si.encode_membar(&op),
-            Op::BClear(op) => si.encode_bclear(&op),
-            Op::BMov(op) => si.encode_bmov(&op),
-            Op::Break(op) => si.encode_break(&op),
-            Op::BSSy(op) => si.encode_bssy(&op, ip, labels),
-            Op::BSync(op) => si.encode_bsync(&op),
-            Op::Bra(op) => si.encode_bra(&op, ip, labels),
-            Op::Exit(op) => si.encode_exit(&op),
-            Op::WarpSync(op) => si.encode_warpsync(&op),
-            Op::Bar(op) => si.encode_bar(&op),
-            Op::CS2R(op) => si.encode_cs2r(&op),
-            Op::Isberd(op) => si.encode_isberd(&op),
-            Op::Kill(op) => si.encode_kill(&op),
-            Op::Nop(op) => si.encode_nop(&op),
-            Op::PixLd(op) => si.encode_pixld(&op),
-            Op::S2R(op) => si.encode_s2r(&op),
-            Op::Out(op) => si.encode_out(&op),
-            Op::OutFinal(op) => si.encode_out_final(&op),
-            Op::Vote(op) => si.encode_vote(&op),
+            Op::FAdd(op) => si.encode_fadd(op),
+            Op::FFma(op) => si.encode_ffma(op),
+            Op::FMnMx(op) => si.encode_fmnmx(op),
+            Op::FMul(op) => si.encode_fmul(op),
+            Op::FSet(op) => si.encode_fset(op),
+            Op::FSetP(op) => si.encode_fsetp(op),
+            Op::FSwzAdd(op) => si.encode_fswzadd(op),
+            Op::DAdd(op) => si.encode_dadd(op),
+            Op::DFma(op) => si.encode_dfma(op),
+            Op::DMul(op) => si.encode_dmul(op),
+            Op::DSetP(op) => si.encode_dsetp(op),
+            Op::MuFu(op) => si.encode_mufu(op),
+            Op::BMsk(op) => si.encode_bmsk(op),
+            Op::BRev(op) => si.encode_brev(op),
+            Op::Flo(op) => si.encode_flo(op),
+            Op::IAbs(op) => si.encode_iabs(op),
+            Op::IAdd3(op) => si.encode_iadd3(op),
+            Op::IAdd3X(op) => si.encode_iadd3x(op),
+            Op::IDp4(op) => si.encode_idp4(op),
+            Op::IMad(op) => si.encode_imad(op),
+            Op::IMad64(op) => si.encode_imad64(op),
+            Op::IMnMx(op) => si.encode_imnmx(op),
+            Op::ISetP(op) => si.encode_isetp(op),
+            Op::Lop3(op) => si.encode_lop3(op),
+            Op::PopC(op) => si.encode_popc(op),
+            Op::Shf(op) => si.encode_shf(op),
+            Op::F2F(op) => si.encode_f2f(op),
+            Op::F2I(op) => si.encode_f2i(op),
+            Op::I2F(op) => si.encode_i2f(op),
+            Op::FRnd(op) => si.encode_frnd(op),
+            Op::Mov(op) => si.encode_mov(op),
+            Op::Prmt(op) => si.encode_prmt(op),
+            Op::Sel(op) => si.encode_sel(op),
+            Op::Shfl(op) => si.encode_shfl(op),
+            Op::PLop3(op) => si.encode_plop3(op),
+            Op::Tex(op) => si.encode_tex(op),
+            Op::Tld(op) => si.encode_tld(op),
+            Op::Tld4(op) => si.encode_tld4(op),
+            Op::Tmml(op) => si.encode_tmml(op),
+            Op::Txd(op) => si.encode_txd(op),
+            Op::Txq(op) => si.encode_txq(op),
+            Op::SuLd(op) => si.encode_suld(op),
+            Op::SuSt(op) => si.encode_sust(op),
+            Op::SuAtom(op) => si.encode_suatom(op),
+            Op::Ld(op) => si.encode_ld(op),
+            Op::Ldc(op) => si.encode_ldc(op),
+            Op::St(op) => si.encode_st(op),
+            Op::Atom(op) => si.encode_atom(op),
+            Op::AL2P(op) => si.encode_al2p(op),
+            Op::ALd(op) => si.encode_ald(op),
+            Op::ASt(op) => si.encode_ast(op),
+            Op::Ipa(op) => si.encode_ipa(op),
+            Op::LdTram(op) => si.encode_ldtram(op),
+            Op::CCtl(op) => si.encode_cctl(op),
+            Op::MemBar(op) => si.encode_membar(op),
+            Op::BClear(op) => si.encode_bclear(op),
+            Op::BMov(op) => si.encode_bmov(op),
+            Op::Break(op) => si.encode_break(op),
+            Op::BSSy(op) => si.encode_bssy(op, ip, labels),
+            Op::BSync(op) => si.encode_bsync(op),
+            Op::Bra(op) => si.encode_bra(op, ip, labels),
+            Op::Exit(op) => si.encode_exit(op),
+            Op::WarpSync(op) => si.encode_warpsync(op),
+            Op::Bar(op) => si.encode_bar(op),
+            Op::CS2R(op) => si.encode_cs2r(op),
+            Op::Isberd(op) => si.encode_isberd(op),
+            Op::Kill(op) => si.encode_kill(op),
+            Op::Nop(op) => si.encode_nop(op),
+            Op::PixLd(op) => si.encode_pixld(op),
+            Op::S2R(op) => si.encode_s2r(op),
+            Op::Out(op) => si.encode_out(op),
+            Op::OutFinal(op) => si.encode_out_final(op),
+            Op::Vote(op) => si.encode_vote(op),
             _ => panic!("Unhandled instruction"),
         }
 
@@ -2013,13 +2088,10 @@ impl Shader {
         for b in &func.blocks {
             labels.insert(b.label, ip);
             for instr in &b.instrs {
-                match &instr.op {
-                    Op::Nop(op) => {
-                        if let Some(label) = op.label {
-                            labels.insert(label, ip);
-                        }
+                if let Op::Nop(op) = &instr.op {
+                    if let Some(label) = op.label {
+                        labels.insert(label, ip);
                     }
-                    _ => (),
                 }
                 ip += 4;
             }

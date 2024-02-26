@@ -41,7 +41,7 @@ static inline void radv_aco_convert_ps_epilog_key(struct aco_ps_epilog_info *aco
 
 static inline void
 radv_aco_convert_shader_info(struct aco_shader_info *aco_info, const struct radv_shader_info *radv,
-                             const struct radv_shader_args *radv_args, const struct radv_pipeline_key *radv_key,
+                             const struct radv_shader_args *radv_args, const struct radv_device_cache_key *radv_key,
                              const enum amd_gfx_level gfx_level)
 {
    ASSIGN_FIELD(wave_size);
@@ -58,7 +58,6 @@ radv_aco_convert_shader_info(struct aco_shader_info *aco_info, const struct radv
    ASSIGN_FIELD(tcs.num_linked_patch_outputs);
    ASSIGN_FIELD(tcs.tcs_vertices_out);
    ASSIGN_FIELD(ps.num_interp);
-   ASSIGN_FIELD(cs.subgroup_size);
    ASSIGN_FIELD(cs.uses_full_subgroups);
    aco_info->ps.spi_ps_input_ena = radv->ps.spi_ps_input;
    aco_info->ps.spi_ps_input_addr = radv->ps.spi_ps_input;
@@ -127,7 +126,7 @@ radv_aco_convert_ps_epilog_key(struct aco_ps_epilog_info *aco_info, const struct
 
 static inline void
 radv_aco_convert_opts(struct aco_compiler_options *aco_info, const struct radv_nir_compiler_options *radv,
-                      const struct radv_shader_args *radv_args)
+                      const struct radv_shader_args *radv_args, const struct radv_shader_stage_key *stage_key)
 {
    ASSIGN_FIELD(dump_shader);
    ASSIGN_FIELD(dump_preoptir);
@@ -140,7 +139,7 @@ radv_aco_convert_opts(struct aco_compiler_options *aco_info, const struct radv_n
    ASSIGN_FIELD(debug.private_data);
    aco_info->is_opengl = false;
    aco_info->load_grid_size_from_user_sgpr = radv_args->load_grid_size_from_user_sgpr;
-   aco_info->optimisations_disabled = radv->key.optimisations_disabled;
+   aco_info->optimisations_disabled = stage_key->optimisations_disabled;
    aco_info->gfx_level = radv->info->gfx_level;
    aco_info->family = radv->info->family;
    aco_info->address32_hi = radv->info->address32_hi;

@@ -126,8 +126,16 @@ get_cps_state_offset(struct anv_device *device, bool cps_enabled,
 }
 #endif /* GFX_VER >= 12 */
 
+static bool
+has_ds_feedback_loop(const struct vk_dynamic_graphics_state *dyn)
+{
+   return dyn->feedback_loops & (VK_IMAGE_ASPECT_DEPTH_BIT |
+                                 VK_IMAGE_ASPECT_STENCIL_BIT);
+}
+
 UNUSED static bool
 want_stencil_pma_fix(struct anv_cmd_buffer *cmd_buffer,
+                     const struct vk_dynamic_graphics_state *dyn,
                      const struct vk_depth_stencil_state *ds)
 {
    if (GFX_VER > 9)
@@ -240,12 +248,14 @@ want_stencil_pma_fix(struct anv_cmd_buffer *cmd_buffer,
     * (3DSTATE_PS_EXTRA::Pixel Shader Computed Depth mode != PSCDEPTH_OFF)
     */
    return pipeline->kill_pixel ||
+          pipeline->rp_has_ds_self_dep ||
+          has_ds_feedback_loop(dyn) ||
           wm_prog_data->computed_depth_mode != PSCDEPTH_OFF;
 }
 
 static void
 genX(rasterization_mode)(VkPolygonMode raster_mode,
-                         VkLineRasterizationModeEXT line_mode,
+                         VkLineRasterizationModeKHR line_mode,
                          float line_width,
                          uint32_t *api_mode,
                          bool *msaa_rasterization_enable)
@@ -496,8 +506,8 @@ genX(cmd_buffer_flush_gfx_runtime_state)(struct anv_cmd_buffer *cmd_buffer)
       SET(STREAMOUT, so.RenderingDisable, dyn->rs.rasterizer_discard_enable);
       SET(STREAMOUT, so.RenderStreamSelect, dyn->rs.rasterization_stream);
 
-#if INTEL_NEEDS_WA_14017076903
-      /* Wa_14017076903 :
+#if INTEL_NEEDS_WA_18022508906
+      /* Wa_18022508906 :
        *
        * SKL PRMs, Volume 7: 3D-Media-GPGPU, Stream Output Logic (SOL) Stage:
        *
@@ -525,8 +535,9 @@ genX(cmd_buffer_flush_gfx_runtime_state)(struct anv_cmd_buffer *cmd_buffer)
        * Here we force rendering to get SOL_INT::Render_Enable when occlusion
        * queries are active.
        */
-      if (!GET(so.RenderingDisable) && gfx->n_occlusion_queries > 0)
-         SET(STREAMOUT, so.ForceRendering, Force_on);
+      SET(STREAMOUT, so.ForceRendering,
+          (!GET(so.RenderingDisable) && gfx->n_occlusion_queries > 0) ?
+          Force_on : 0);
 #endif
 
       switch (dyn->rs.provoking_vertex) {
@@ -663,7 +674,7 @@ genX(cmd_buffer_flush_gfx_runtime_state)(struct anv_cmd_buffer *cmd_buffer)
       uint32_t api_mode = 0;
       bool msaa_raster_enable = false;
 
-      const VkLineRasterizationModeEXT line_mode =
+      const VkLineRasterizationModeKHR line_mode =
          anv_line_rasterization_mode(dyn->rs.line.mode,
                                      pipeline->rasterization_samples);
 
@@ -791,7 +802,7 @@ genX(cmd_buffer_flush_gfx_runtime_state)(struct anv_cmd_buffer *cmd_buffer)
                             genX(vk_to_intel_compare_op)[opt_ds.stencil.back.op.compare]);
 
 #if GFX_VER == 9
-      const bool pma = want_stencil_pma_fix(cmd_buffer, &opt_ds);
+      const bool pma = want_stencil_pma_fix(cmd_buffer, dyn, &opt_ds);
       SET(PMA_FIX, pma_fix, pma);
 #endif
 
@@ -858,6 +869,17 @@ genX(cmd_buffer_flush_gfx_runtime_state)(struct anv_cmd_buffer *cmd_buffer)
          (pipeline->force_fragment_thread_dispatch ||
           anv_cmd_buffer_all_color_write_masked(cmd_buffer));
       SET(WM, wm.ForceThreadDispatchEnable, force_thread_dispatch ? ForceON : 0);
+   }
+
+   if ((cmd_buffer->state.gfx.dirty & ANV_CMD_DIRTY_PIPELINE) ||
+       BITSET_TEST(dyn->dirty, MESA_VK_DYNAMIC_ATTACHMENT_FEEDBACK_LOOP_ENABLE)) {
+      const struct brw_wm_prog_data *wm_prog_data = get_wm_prog_data(pipeline);
+
+      SET_STAGE(PS_EXTRA, ps_extra.PixelShaderKillsPixel,
+                wm_prog_data && (pipeline->rp_has_ds_self_dep ||
+                                 has_ds_feedback_loop(dyn) ||
+                                 wm_prog_data->uses_kill),
+                FRAGMENT);
    }
 
    if ((gfx->dirty & ANV_CMD_DIRTY_PIPELINE) ||
@@ -1461,9 +1483,6 @@ cmd_buffer_gfx_state_emission(struct anv_cmd_buffer *cmd_buffer)
    if (BITSET_TEST(hw_state->dirty, ANV_GFX_STATE_PS))
       anv_batch_emit_pipeline_state(&cmd_buffer->batch, pipeline, final.ps);
 
-   if (BITSET_TEST(hw_state->dirty, ANV_GFX_STATE_PS_EXTRA))
-      anv_batch_emit_pipeline_state(&cmd_buffer->batch, pipeline, final.ps_extra);
-
    if (device->vk.enabled_extensions.EXT_mesh_shader) {
       if (BITSET_TEST(hw_state->dirty, ANV_GFX_STATE_MESH_CONTROL))
          anv_batch_emit_pipeline_state(&cmd_buffer->batch, pipeline, final.mesh_control);
@@ -1506,6 +1525,13 @@ cmd_buffer_gfx_state_emission(struct anv_cmd_buffer *cmd_buffer)
 
    /* Now the potentially dynamic instructions */
 
+   if (BITSET_TEST(hw_state->dirty, ANV_GFX_STATE_PS_EXTRA)) {
+      anv_batch_emit_merge(&cmd_buffer->batch, GENX(3DSTATE_PS_EXTRA),
+                           pipeline, partial.ps_extra, pse) {
+         SET(pse, ps_extra, PixelShaderKillsPixel);
+      }
+   }
+
    if (BITSET_TEST(hw_state->dirty, ANV_GFX_STATE_CLIP)) {
       anv_batch_emit_merge(&cmd_buffer->batch, GENX(3DSTATE_CLIP),
                            pipeline, partial.clip, clip) {
@@ -1526,6 +1552,7 @@ cmd_buffer_gfx_state_emission(struct anv_cmd_buffer *cmd_buffer)
          SET(so, so, RenderingDisable);
          SET(so, so, RenderStreamSelect);
          SET(so, so, ReorderMode);
+         SET(so, so, ForceRendering);
       }
    }
 
@@ -1821,13 +1848,15 @@ cmd_buffer_gfx_state_emission(struct anv_cmd_buffer *cmd_buffer)
       anv_batch_emit(&cmd_buffer->batch, GENX(3DSTATE_INDEX_BUFFER), ib) {
          ib.IndexFormat           = gfx->index_type;
          ib.MOCS                  = anv_mocs(cmd_buffer->device,
-                                             buffer->address.bo,
+                                             buffer ? buffer->address.bo : NULL,
                                              ISL_SURF_USAGE_INDEX_BUFFER_BIT);
 #if GFX_VER >= 12
          ib.L3BypassDisable       = true;
 #endif
-         ib.BufferStartingAddress = anv_address_add(buffer->address, offset);
-         ib.BufferSize            = gfx->index_size;
+         if (buffer) {
+            ib.BufferStartingAddress = anv_address_add(buffer->address, offset);
+            ib.BufferSize            = gfx->index_size;
+         }
       }
    }
 

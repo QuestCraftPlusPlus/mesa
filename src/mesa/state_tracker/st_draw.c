@@ -89,10 +89,10 @@ st_prepare_draw(struct gl_context *ctx, uint64_t state_mask)
    /* Validate state. */
    st_validate_state(st, state_mask);
 
-   /* Pin threads regularly to the same Zen CCX that the main thread is
-    * running on. The main thread can move between CCXs.
+   /* Apply our thread scheduling policy for better multithreading
+    * performance.
     */
-   if (unlikely(st->pin_thread_counter != ST_L3_PINNING_DISABLED &&
+   if (unlikely(st->pin_thread_counter != ST_THREAD_SCHEDULER_DISABLED &&
                 /* do it occasionally */
                 ++st->pin_thread_counter % 512 == 0)) {
       st->pin_thread_counter = 0;
@@ -104,23 +104,24 @@ st_prepare_draw(struct gl_context *ctx, uint64_t state_mask)
 
          if (L3_cache != U_CPU_INVALID_L3) {
             pipe->set_context_param(pipe,
-                                    PIPE_CONTEXT_PARAM_PIN_THREADS_TO_L3_CACHE,
-                                    L3_cache);
+                                    PIPE_CONTEXT_PARAM_UPDATE_THREAD_SCHEDULING,
+                                    cpu);
          }
       }
    }
 }
 
-static void
+void
 st_draw_gallium(struct gl_context *ctx,
                 struct pipe_draw_info *info,
                 unsigned drawid_offset,
+                const struct pipe_draw_indirect_info *indirect,
                 const struct pipe_draw_start_count_bias *draws,
                 unsigned num_draws)
 {
    struct st_context *st = st_context(ctx);
 
-   cso_draw_vbo(st->cso_context, info, drawid_offset, NULL, draws, num_draws);
+   cso_draw_vbo(st->cso_context, info, drawid_offset, indirect, draws, num_draws);
 }
 
 static void
@@ -161,7 +162,7 @@ rewrite_partial_stride_indirect(struct st_context *st,
    if (!new_draws)
       return;
    for (unsigned i = 0; i < draw_count; i++)
-      cso_draw_vbo(st->cso_context, &new_draws[i].info, i, NULL, &new_draws[i].draw, 1);
+      st->ctx->Driver.DrawGallium(st->ctx, &new_draws[i].info, i, NULL, &new_draws[i].draw, 1);
    free(new_draws);
 }
 
@@ -243,7 +244,7 @@ st_indirect_draw_vbo(struct gl_context *ctx,
 
       indirect.draw_count = 1;
       for (i = 0; i < draw_count; i++) {
-         cso_draw_vbo(st->cso_context, &info, i, &indirect, &draw, 1);
+         ctx->Driver.DrawGallium(ctx, &info, i, &indirect, &draw, 1);
          indirect.offset += stride;
       }
    } else {
@@ -263,7 +264,7 @@ st_indirect_draw_vbo(struct gl_context *ctx,
             indirect_draw_count->buffer;
          indirect.indirect_draw_count_offset = indirect_draw_count_offset;
       }
-      cso_draw_vbo(st->cso_context, &info, 0, &indirect, &draw, 1);
+      ctx->Driver.DrawGallium(ctx, &info, 0, &indirect, &draw, 1);
    }
 
    if (MESA_DEBUG_FLAGS & DEBUG_ALWAYS_FLUSH)
@@ -420,8 +421,7 @@ st_draw_quad(struct st_context *st,
 
    u_upload_unmap(st->pipe->stream_uploader);
 
-   cso_set_vertex_buffers(st->cso_context, 1, 0, false, &vb);
-   st->last_num_vbuffers = MAX2(st->last_num_vbuffers, 1);
+   cso_set_vertex_buffers(st->cso_context, 1, false, &vb);
 
    if (num_instances > 1) {
       cso_draw_arrays_instanced(st->cso_context, MESA_PRIM_TRIANGLE_FAN, 0, 4,
@@ -439,16 +439,20 @@ static void
 st_hw_select_draw_gallium(struct gl_context *ctx,
                           struct pipe_draw_info *info,
                           unsigned drawid_offset,
+                          const struct pipe_draw_indirect_info *indirect,
                           const struct pipe_draw_start_count_bias *draws,
                           unsigned num_draws)
 {
    struct st_context *st = st_context(ctx);
+   enum mesa_prim old_mode = info->mode;
 
-   if (!st_draw_hw_select_prepare_common(ctx) ||
-       !st_draw_hw_select_prepare_mode(ctx, info))
-      return;
+   if (st_draw_hw_select_prepare_common(ctx) &&
+       st_draw_hw_select_prepare_mode(ctx, info)) {
+      cso_draw_vbo(st->cso_context, info, drawid_offset, indirect, draws,
+                   num_draws);
+   }
 
-   cso_draw_vbo(st->cso_context, info, drawid_offset, NULL, draws, num_draws);
+   info->mode = old_mode;
 }
 
 static void

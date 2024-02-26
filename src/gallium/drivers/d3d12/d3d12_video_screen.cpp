@@ -84,6 +84,7 @@ get_level_resolution_video_decode_support(D3D12_VIDEO_DECODE_CONFIGURATION decod
    }
 
    d3d12_video_resolution_to_level_mapping_entry resolutionsLevelList[] = {
+      { { 8192, 4352 }, 61 },   // 8k
       { { 8192, 4320 }, 61 },   // 8k
       { { 7680, 4800 }, 61 },   // 8k - alternative
       { { 7680, 4320 }, 61 },   // 8k - alternative
@@ -98,6 +99,7 @@ get_level_resolution_video_decode_support(D3D12_VIDEO_DECODE_CONFIGURATION decod
       { { 352, 240 }, 2 },
       { { 176, 144 }, 11 },
       { { 128, 96 }, 11 },
+      { { 64, 64 }, 11 },
    };
 
    D3D12_FEATURE_DATA_VIDEO_DECODE_SUPPORT decodeSupport = {};
@@ -846,7 +848,8 @@ d3d12_has_video_encode_support(struct pipe_screen *pscreen,
                                uint32_t &maxQualityLevels,
                                uint32_t &max_tile_rows,
                                uint32_t &max_tile_cols,
-                               uint32_t &maxIRDuration)
+                               uint32_t &maxIRDuration,
+                               union pipe_enc_cap_roi &roi_support)
 {
    ComPtr<ID3D12VideoDevice3> spD3D12VideoDevice;
    struct d3d12_screen *pD3D12Screen = (struct d3d12_screen *) pscreen;
@@ -934,6 +937,10 @@ d3d12_has_video_encode_support(struct pipe_screen *pscreen,
                                                                             profile,
                                                                             spD3D12VideoDevice.Get(),
                                                                             codecSupport);
+
+            memset(&roi_support, 0, sizeof(roi_support));
+            roi_support.bits.roi_rc_qp_delta_support = ((capEncoderSupportData1.SupportFlags & D3D12_VIDEO_ENCODER_SUPPORT_FLAG_RATE_CONTROL_DELTA_QP_AVAILABLE) != 0) ? 1 : 0;
+            roi_support.bits.num_roi_regions = roi_support.bits.roi_rc_qp_delta_support ? PIPE_ENC_ROI_REGION_NUM_MAX : 0;
 
             supportsProfile = d3d12_video_encode_get_h264_codec_support(profDesc,
                                                                         spD3D12VideoDevice.Get(),
@@ -1105,6 +1112,10 @@ d3d12_has_video_encode_support(struct pipe_screen *pscreen,
 
                maxIRDuration = resolutionDepCaps.MaxIntraRefreshFrameDuration;
                isRCMaxFrameSizeSupported = ((capEncoderSupportData1.SupportFlags & D3D12_VIDEO_ENCODER_SUPPORT_FLAG_RATE_CONTROL_MAX_FRAME_SIZE_AVAILABLE) != 0) ? 1 : 0;
+
+               memset(&roi_support, 0, sizeof(roi_support));
+               roi_support.bits.roi_rc_qp_delta_support = ((capEncoderSupportData1.SupportFlags & D3D12_VIDEO_ENCODER_SUPPORT_FLAG_RATE_CONTROL_DELTA_QP_AVAILABLE) != 0) ? 1 : 0;
+               roi_support.bits.num_roi_regions = roi_support.bits.roi_rc_qp_delta_support ? PIPE_ENC_ROI_REGION_NUM_MAX : 0;
             }
          }
       } break;
@@ -1364,6 +1375,9 @@ d3d12_has_video_encode_support(struct pipe_screen *pscreen,
                codecSupport.av1_support.features_ext2.bits.max_tile_num_minus1 = maxSlices - 1;
 
                isRCMaxFrameSizeSupported = ((capEncoderSupportData1.SupportFlags & D3D12_VIDEO_ENCODER_SUPPORT_FLAG_RATE_CONTROL_MAX_FRAME_SIZE_AVAILABLE) != 0) ? 1 : 0;
+               memset(&roi_support, 0, sizeof(roi_support));
+               roi_support.bits.roi_rc_qp_delta_support = ((capEncoderSupportData1.SupportFlags & D3D12_VIDEO_ENCODER_SUPPORT_FLAG_RATE_CONTROL_DELTA_QP_AVAILABLE) != 0) ? 1 : 0;
+               roi_support.bits.num_roi_regions = roi_support.bits.roi_rc_qp_delta_support ? PIPE_ENC_ROI_REGION_NUM_MAX : 0;
             }
          }
       } break;
@@ -1666,6 +1680,7 @@ d3d12_screen_get_video_param_encode(struct pipe_screen *pscreen,
    uint32_t max_tile_rows = 0u;
    uint32_t max_tile_cols = 0u;
    uint32_t maxIRDuration = 0u;
+   union pipe_enc_cap_roi roi_support = {};
    struct d3d12_encode_codec_support codec_specific_support;
    memset(&codec_specific_support, 0, sizeof(codec_specific_support));
    switch (param) {
@@ -1703,8 +1718,10 @@ d3d12_screen_get_video_param_encode(struct pipe_screen *pscreen,
       case PIPE_VIDEO_CAP_ENC_MAX_TILE_ROWS:
       case PIPE_VIDEO_CAP_ENC_MAX_TILE_COLS:
       case PIPE_VIDEO_CAP_ENC_INTRA_REFRESH_MAX_DURATION:
+      case PIPE_VIDEO_CAP_ENC_INTRA_REFRESH:
       case PIPE_VIDEO_CAP_ENC_H264_DISABLE_DBK_FILTER_MODES_SUPPORTED:
       case PIPE_VIDEO_CAP_ENC_H264_SUPPORTS_CABAC_ENCODE:
+      case PIPE_VIDEO_CAP_ENC_ROI:
       {
          if (d3d12_has_video_encode_support(pscreen,
                                             profile,
@@ -1719,7 +1736,8 @@ d3d12_screen_get_video_param_encode(struct pipe_screen *pscreen,
                                             maxQualityLevels,
                                             max_tile_rows,
                                             max_tile_cols,
-                                            maxIRDuration)) {
+                                            maxIRDuration,
+                                            roi_support)) {
 
             DXGI_FORMAT format = d3d12_convert_pipe_video_profile_to_dxgi_format(profile);
             auto pipeFmt = d3d12_get_pipe_format(format);
@@ -1751,6 +1769,14 @@ d3d12_screen_get_video_param_encode(struct pipe_screen *pscreen,
                   return maxReferencesPerFrame;
                } else if (param == PIPE_VIDEO_CAP_ENC_INTRA_REFRESH_MAX_DURATION) {
                   return maxIRDuration;
+               } else if (param == PIPE_VIDEO_CAP_ENC_INTRA_REFRESH) {
+                  return (maxIRDuration == 0) ? 0 :
+                         (PIPE_VIDEO_ENC_INTRA_REFRESH_ROW |
+                          PIPE_VIDEO_ENC_INTRA_REFRESH_ADAPTIVE |
+                          PIPE_VIDEO_ENC_INTRA_REFRESH_CYCLIC |
+                          PIPE_VIDEO_ENC_INTRA_REFRESH_P_FRAME |
+                          PIPE_VIDEO_ENC_INTRA_REFRESH_B_FRAME |
+                          PIPE_VIDEO_ENC_INTRA_REFRESH_MULTI_REF);
                } else if (param == PIPE_VIDEO_CAP_ENC_SUPPORTS_MAX_FRAME_SIZE) {
                   return isRCMaxFrameSizeSupported;
                } else if (param == PIPE_VIDEO_CAP_ENC_HEVC_FEATURE_FLAGS) {
@@ -1783,6 +1809,9 @@ d3d12_screen_get_video_param_encode(struct pipe_screen *pscreen,
                   return (profile == PIPE_VIDEO_PROFILE_AV1_MAIN) && (maxSlices != 0);
                } else if(param == PIPE_VIDEO_CAP_ENC_QUALITY_LEVEL) {
                   return maxQualityLevels;
+               } else if(param == PIPE_VIDEO_CAP_ENC_ROI) {
+                  assert(roi_support.bits.num_roi_regions <= PIPE_ENC_ROI_REGION_NUM_MAX);
+                  return static_cast<int>(roi_support.value);
                }
             }
          } else if (param == PIPE_VIDEO_CAP_ENC_QUALITY_LEVEL) {

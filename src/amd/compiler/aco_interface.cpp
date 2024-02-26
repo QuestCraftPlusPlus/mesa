@@ -98,7 +98,7 @@ get_disasm_string(aco::Program* program, std::vector<uint32_t>& code, unsigned e
          aco::print_asm(program, code, exec_size / 4u, memf);
       } else {
          fprintf(memf, "Shader disassembly is not supported in the current configuration"
-#ifndef LLVM_AVAILABLE
+#if !LLVM_AVAILABLE
                        " (LLVM not available)"
 #endif
                        ", falling back to print_program.\n\n");
@@ -198,6 +198,10 @@ aco_postprocess_shader(const struct aco_compiler_options* options,
    /* Lower to HW Instructions */
    aco::lower_to_hw_instr(program.get());
    validate(program.get());
+
+   /* Schedule hardware instructions for ILP */
+   if (!options->optimisations_disabled && !(aco::debug_flags & aco::DEBUG_NO_SCHED_ILP))
+      aco::schedule_ilp(program.get());
 
    /* Insert Waitcnt */
    aco::insert_wait_states(program.get());

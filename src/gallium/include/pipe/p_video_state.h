@@ -666,12 +666,18 @@ struct pipe_h264_enc_picture_desc
    unsigned num_slice_descriptors;
    struct h264_slice_descriptor slices_descriptors[128];
 
-   /* Use with PIPE_VIDEO_SLICE_MODE_MAX_SLICE_SICE */
+   /* Use with PIPE_VIDEO_SLICE_MODE_MAX_SLICE_SIZE */
    unsigned max_slice_bytes;
 
    bool insert_aud_nalu;
    enum pipe_video_feedback_metadata_type requested_metadata;
    bool renew_headers_on_idr;
+};
+
+struct pipe_h265_st_ref_pic_set
+{
+   uint32_t num_neg_pics;
+   uint32_t num_pos_pics;
 };
 
 struct pipe_h265_enc_sublayer_hrd_params
@@ -861,7 +867,7 @@ struct pipe_h265_enc_picture_desc
    unsigned num_slice_descriptors;
    struct h265_slice_descriptor slices_descriptors[128];
 
-   /* Use with PIPE_VIDEO_SLICE_MODE_MAX_SLICE_SICE */
+   /* Use with PIPE_VIDEO_SLICE_MODE_MAX_SLICE_SIZE */
    unsigned max_slice_bytes;
    enum pipe_video_feedback_metadata_type requested_metadata;
    bool renew_headers_on_idr;

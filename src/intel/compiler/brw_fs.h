@@ -122,6 +122,7 @@ struct gs_thread_payload : public thread_payload {
 
    fs_reg urb_handles;
    fs_reg primitive_id;
+   fs_reg instance_id;
    fs_reg icp_handle_start;
 };
 
@@ -137,7 +138,7 @@ struct fs_thread_payload : public thread_payload {
    uint8_t dest_depth_reg[2];
    uint8_t sample_pos_reg[2];
    uint8_t sample_mask_in_reg[2];
-   uint8_t depth_w_coef_reg[2];
+   uint8_t depth_w_coef_reg;
    uint8_t barycentric_coord_reg[BRW_BARYCENTRIC_MODE_COUNT][2];
 };
 
@@ -145,6 +146,8 @@ struct cs_thread_payload : public thread_payload {
    cs_thread_payload(const fs_visitor &v);
 
    void load_subgroup_id(const brw::fs_builder &bld, fs_reg &dest) const;
+
+   fs_reg local_invocation_id[3];
 
 protected:
    fs_reg subgroup_id_;
@@ -188,6 +191,15 @@ public:
               struct brw_stage_prog_data *prog_data,
               const nir_shader *shader,
               unsigned dispatch_width,
+              bool needs_register_pressure,
+              bool debug_enabled);
+   fs_visitor(const struct brw_compiler *compiler,
+              const struct brw_compile_params *params,
+              const brw_wm_prog_key *key,
+              struct brw_wm_prog_data *prog_data,
+              const nir_shader *shader,
+              unsigned dispatch_width,
+              unsigned num_polygons,
               bool needs_register_pressure,
               bool debug_enabled);
    fs_visitor(const struct brw_compiler *compiler,
@@ -260,7 +272,6 @@ public:
    bool opt_cse_local(const brw::fs_live_variables &live, bblock_t *block, int &ip);
 
    bool opt_copy_propagation();
-   bool opt_register_renaming();
    bool opt_bank_conflicts();
    bool opt_split_sends();
    bool register_coalesce();
@@ -322,8 +333,10 @@ public:
    void emit_urb_fence();
    void emit_cs_terminate();
 
-   fs_reg interp_reg(int location, int channel);
-   fs_reg per_primitive_reg(int location, unsigned comp);
+   fs_reg interp_reg(const brw::fs_builder &bld, unsigned location,
+                     unsigned channel, unsigned comp);
+   fs_reg per_primitive_reg(const brw::fs_builder &bld,
+                            int location, unsigned comp);
 
    virtual void dump_instruction_to_file(const backend_instruction *inst, FILE *file) const;
    virtual void dump_instructions_to_file(FILE *file) const;
@@ -427,6 +440,7 @@ public:
    bool needs_register_pressure;
 
    const unsigned dispatch_width; /**< 8, 16 or 32 */
+   const unsigned max_polygons;
    unsigned max_dispatch_width;
 
    /* The API selected subgroup size */
@@ -477,7 +491,8 @@ public:
    int generate_code(const cfg_t *cfg, int dispatch_width,
                      struct shader_stats shader_stats,
                      const brw::performance &perf,
-                     struct brw_compile_stats *stats);
+                     struct brw_compile_stats *stats,
+                     unsigned max_polygons = 0);
    void add_const_data(void *data, unsigned size);
    void add_resume_sbt(unsigned num_resume_shaders, uint64_t *sbt);
    const unsigned *get_assembly();
@@ -562,7 +577,8 @@ private:
 namespace brw {
    fs_reg
    fetch_payload_reg(const brw::fs_builder &bld, uint8_t regs[2],
-                     brw_reg_type type = BRW_REGISTER_TYPE_F);
+                     brw_reg_type type = BRW_REGISTER_TYPE_F,
+                     unsigned n = 1);
 
    fs_reg
    fetch_barycentric_reg(const brw::fs_builder &bld, uint8_t regs[2]);
@@ -612,6 +628,8 @@ void brw_emit_predicate_on_sample_mask(const brw::fs_builder &bld, fs_inst *inst
 
 int brw_get_subgroup_id_param_index(const intel_device_info *devinfo,
                                     const brw_stage_prog_data *prog_data);
+
+bool brw_lower_dpas(fs_visitor &v);
 
 void nir_to_brw(fs_visitor *s);
 

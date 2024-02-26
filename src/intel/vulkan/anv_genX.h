@@ -90,7 +90,8 @@ void genX(cmd_buffer_emit_hashing_mode)(struct anv_cmd_buffer *cmd_buffer,
 
 void genX(flush_pipeline_select_3d)(struct anv_cmd_buffer *cmd_buffer);
 void genX(flush_pipeline_select_gpgpu)(struct anv_cmd_buffer *cmd_buffer);
-void genX(emit_pipeline_select)(struct anv_batch *batch, uint32_t pipeline);
+void genX(emit_pipeline_select)(struct anv_batch *batch, uint32_t pipeline,
+                                const struct anv_device *device);
 
 void genX(apply_task_urb_workaround)(struct anv_cmd_buffer *cmd_buffer);
 
@@ -131,6 +132,17 @@ void genX(emit_l3_config)(struct anv_batch *batch,
 
 void genX(cmd_buffer_config_l3)(struct anv_cmd_buffer *cmd_buffer,
                                 const struct intel_l3_config *cfg);
+
+uint32_t
+genX(cmd_buffer_flush_descriptor_sets)(struct anv_cmd_buffer *cmd_buffer,
+                                       struct anv_cmd_pipeline_state *pipe_state,
+                                       const VkShaderStageFlags dirty,
+                                       struct anv_shader_bin **shaders,
+                                       uint32_t num_shaders);
+void
+genX(cmd_buffer_flush_push_descriptor_set)(struct anv_cmd_buffer *cmd_buffer,
+                                           struct anv_cmd_pipeline_state *state,
+                                           struct anv_pipeline *pipeline);
 
 void genX(cmd_buffer_flush_gfx_hw_state)(struct anv_cmd_buffer *cmd_buffer);
 

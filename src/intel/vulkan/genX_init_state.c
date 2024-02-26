@@ -352,7 +352,7 @@ init_render_queue_state(struct anv_queue *queue, bool is_companion_rcs_batch)
    };
    GENX(VERTEX_ELEMENT_STATE_pack)(NULL, device->empty_vs_input, &empty_ve);
 
-   genX(emit_pipeline_select)(&batch, _3D);
+   genX(emit_pipeline_select)(&batch, _3D, device);
 
 #if GFX_VER == 9
    anv_batch_write_reg(&batch, GENX(CACHE_MODE_1), cm1) {
@@ -591,20 +591,34 @@ init_render_queue_state(struct anv_queue *queue, bool is_companion_rcs_batch)
    anv_batch_emit(&batch, GENX(STATE_COMPUTE_MODE), zero);
    anv_batch_emit(&batch, GENX(3DSTATE_MESH_CONTROL), zero);
    anv_batch_emit(&batch, GENX(3DSTATE_TASK_CONTROL), zero);
+
+   /* We no longer required to explicitly flush or invalidate caches since the
+    * PIPELINE_SELECT is getting deprecated on Xe2+.
+    */
+#if GFX_VER < 20
    genx_batch_emit_pipe_control_write(&batch, device->info, _3D, NoWrite,
                                       ANV_NULL_ADDRESS,
                                       0,
                                       ANV_PIPE_FLUSH_BITS | ANV_PIPE_INVALIDATE_BITS);
-   genX(emit_pipeline_select)(&batch, GPGPU);
+#endif
+
+   genX(emit_pipeline_select)(&batch, GPGPU, device);
    anv_batch_emit(&batch, GENX(CFE_STATE), cfe) {
       cfe.MaximumNumberofThreads =
          devinfo->max_cs_threads * devinfo->subslice_total;
    }
+
+   /* We no longer required to explicitly flush or invalidate caches since the
+    * PIPELINE_SELECT is getting deprecated on Xe2+.
+    */
+#if GFX_VER < 20
    genx_batch_emit_pipe_control_write(&batch, device->info, _3D, NoWrite,
                                       ANV_NULL_ADDRESS,
                                       0,
                                       ANV_PIPE_FLUSH_BITS | ANV_PIPE_INVALIDATE_BITS);
-   genX(emit_pipeline_select)(&batch, _3D);
+#endif
+
+   genX(emit_pipeline_select)(&batch, _3D, device);
 #endif
 
    anv_batch_emit(&batch, GENX(MI_BATCH_BUFFER_END), bbe);
@@ -628,7 +642,7 @@ init_compute_queue_state(struct anv_queue *queue)
       .end = (void *) cmds + sizeof(cmds),
    };
 
-   genX(emit_pipeline_select)(&batch, GPGPU);
+   genX(emit_pipeline_select)(&batch, GPGPU, queue->device);
 
 #if GFX_VER == 12
    if (queue->device->info->has_aux_map) {
@@ -886,6 +900,7 @@ genX(emit_l3_config)(struct anv_batch *batch,
                      const struct anv_device *device,
                      const struct intel_l3_config *cfg)
 {
+#if GFX_VER < 20
    UNUSED const struct intel_device_info *devinfo = device->info;
 
 #if GFX_VER >= 12
@@ -928,6 +943,7 @@ genX(emit_l3_config)(struct anv_batch *batch,
          l3cr.AllAllocation = cfg->n[INTEL_L3P_ALL];
       }
    }
+#endif /* GFX_VER < 20 */
 }
 
 void

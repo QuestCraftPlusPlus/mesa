@@ -45,7 +45,8 @@ using namespace brw;
  * generate_code() time.
  */
 fs_reg
-fs_visitor::interp_reg(int location, int channel)
+fs_visitor::interp_reg(const fs_builder &bld, unsigned location,
+                       unsigned channel, unsigned comp)
 {
    assert(stage == MESA_SHADER_FRAGMENT);
    assert(BITFIELD64_BIT(location) & ~nir->info.per_primitive_inputs);
@@ -63,7 +64,19 @@ fs_visitor::interp_reg(int location, int channel)
    const unsigned per_vertex_start = prog_data->num_per_primitive_inputs;
    const unsigned regnr = per_vertex_start + (nr * 4) + channel;
 
-   return fs_reg(ATTR, regnr, BRW_REGISTER_TYPE_F);
+   if (max_polygons > 1) {
+      /* In multipolygon dispatch each plane parameter is a
+       * dispatch_width-wide SIMD vector (see comment in
+       * assign_urb_setup()), so we need to use offset() instead of
+       * component() to select the specified parameter.
+       */
+      const fs_reg tmp = bld.vgrf(BRW_REGISTER_TYPE_UD);
+      bld.MOV(tmp, offset(fs_reg(ATTR, regnr, BRW_REGISTER_TYPE_UD),
+                          dispatch_width, comp));
+      return retype(tmp, BRW_REGISTER_TYPE_F);
+   } else {
+      return component(fs_reg(ATTR, regnr, BRW_REGISTER_TYPE_F), comp);
+   }
 }
 
 /* The register location here is relative to the start of the URB
@@ -71,7 +84,7 @@ fs_visitor::interp_reg(int location, int channel)
  * generate_code() time.
  */
 fs_reg
-fs_visitor::per_primitive_reg(int location, unsigned comp)
+fs_visitor::per_primitive_reg(const fs_builder &bld, int location, unsigned comp)
 {
    assert(stage == MESA_SHADER_FRAGMENT);
    assert(BITFIELD64_BIT(location) & nir->info.per_primitive_inputs);
@@ -86,7 +99,19 @@ fs_visitor::per_primitive_reg(int location, unsigned comp)
 
    assert(regnr < prog_data->num_per_primitive_inputs);
 
-   return component(fs_reg(ATTR, regnr, BRW_REGISTER_TYPE_F), comp % 4);
+   if (max_polygons > 1) {
+      /* In multipolygon dispatch each primitive constant is a
+       * dispatch_width-wide SIMD vector (see comment in
+       * assign_urb_setup()), so we need to use offset() instead of
+       * component() to select the specified parameter.
+       */
+      const fs_reg tmp = bld.vgrf(BRW_REGISTER_TYPE_UD);
+      bld.MOV(tmp, offset(fs_reg(ATTR, regnr, BRW_REGISTER_TYPE_UD),
+                          dispatch_width, comp % 4));
+      return retype(tmp, BRW_REGISTER_TYPE_F);
+   } else {
+      return component(fs_reg(ATTR, regnr, BRW_REGISTER_TYPE_F), comp % 4);
+   }
 }
 
 /** Emits the interpolation for the varying inputs. */
@@ -143,7 +168,7 @@ fs_visitor::emit_interpolation_setup_gfx4()
     */
    this->wpos_w = vgrf(glsl_float_type());
    abld.emit(FS_OPCODE_LINTERP, wpos_w, delta_xy,
-             component(interp_reg(VARYING_SLOT_POS, 3), 0));
+             interp_reg(abld, VARYING_SLOT_POS, 3, 0));
    /* Compute the pixel 1/W value from wpos.w. */
    this->pixel_w = vgrf(glsl_float_type());
    abld.emit(SHADER_OPCODE_RCP, this->pixel_w, wpos_w);
@@ -322,7 +347,15 @@ fs_visitor::emit_interpolation_setup_gfx6()
 
    for (unsigned i = 0; i < DIV_ROUND_UP(dispatch_width, 16); i++) {
       const fs_builder hbld = abld.group(MIN2(16, dispatch_width), i);
-      struct brw_reg gi_uw = retype(brw_vec1_grf(1 + i, 0), BRW_REGISTER_TYPE_UW);
+      /* According to the "PS Thread Payload for Normal Dispatch"
+       * pages on the BSpec, subspan X/Y coordinates are stored in
+       * R1.2-R1.5/R2.2-R2.5 on gfx6+, and on R0.10-R0.13/R1.10-R1.13
+       * on gfx20+.  gi_reg is the 32B section of the GRF that
+       * contains the subspan coordinates.
+       */
+      const struct brw_reg gi_reg = devinfo->ver >= 20 ? xe2_vec1_grf(i, 8) :
+                                    brw_vec1_grf(i + 1, 0);
+      const struct brw_reg gi_uw = retype(gi_reg, BRW_REGISTER_TYPE_UW);
 
       if (devinfo->verx10 >= 125) {
          const fs_builder dbld =
@@ -410,7 +443,7 @@ fs_visitor::emit_interpolation_setup_gfx6()
        * pixels locations, here we recompute the Z value with 2 coefficients
        * in X & Y axis.
        */
-      fs_reg coef_payload = fetch_payload_reg(abld, fs_payload().depth_w_coef_reg, BRW_REGISTER_TYPE_F);
+      fs_reg coef_payload = brw_vec8_grf(fs_payload().depth_w_coef_reg, 0);
       const fs_reg x_start = brw_vec1_grf(coef_payload.nr, 2);
       const fs_reg y_start = brw_vec1_grf(coef_payload.nr, 6);
       const fs_reg z_cx    = brw_vec1_grf(coef_payload.nr, 1);
@@ -1141,6 +1174,28 @@ fs_visitor::fs_visitor(const struct brw_compiler *compiler,
      performance_analysis(this),
      needs_register_pressure(needs_register_pressure),
      dispatch_width(dispatch_width),
+     max_polygons(0),
+     api_subgroup_size(brw_nir_api_subgroup_size(shader, dispatch_width))
+{
+   init();
+}
+
+fs_visitor::fs_visitor(const struct brw_compiler *compiler,
+                       const struct brw_compile_params *params,
+                       const brw_wm_prog_key *key,
+                       struct brw_wm_prog_data *prog_data,
+                       const nir_shader *shader,
+                       unsigned dispatch_width, unsigned max_polygons,
+                       bool needs_register_pressure,
+                       bool debug_enabled)
+   : backend_shader(compiler, params, shader, &prog_data->base,
+                    debug_enabled),
+     key(&key->base), gs_compile(NULL), prog_data(&prog_data->base),
+     live_analysis(this), regpressure_analysis(this),
+     performance_analysis(this),
+     needs_register_pressure(needs_register_pressure),
+     dispatch_width(dispatch_width),
+     max_polygons(max_polygons),
      api_subgroup_size(brw_nir_api_subgroup_size(shader, dispatch_width))
 {
    init();
@@ -1164,7 +1219,8 @@ fs_visitor::fs_visitor(const struct brw_compiler *compiler,
      live_analysis(this), regpressure_analysis(this),
      performance_analysis(this),
      needs_register_pressure(needs_register_pressure),
-     dispatch_width(8),
+     dispatch_width(compiler->devinfo->ver >= 20 ? 16 : 8),
+     max_polygons(0),
      api_subgroup_size(brw_nir_api_subgroup_size(shader, dispatch_width))
 {
    init();

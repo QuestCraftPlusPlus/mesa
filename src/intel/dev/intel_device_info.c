@@ -614,7 +614,13 @@ static const struct intel_device_info intel_device_info_chv = {
    GFX8_FEATURES,                                   \
    GFX9_HW_INFO,                                    \
    .has_sample_with_hiz = true,                     \
-   .has_illegal_ccs_values = true
+   .has_illegal_ccs_values = true,                                    \
+   .cooperative_matrix_configurations = {                             \
+    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT16 }, \
+    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT32, INTEL_CMAT_FLOAT32 }, \
+    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 32, INTEL_CMAT_SINT8, INTEL_CMAT_SINT8, INTEL_CMAT_SINT32, INTEL_CMAT_SINT32 },       \
+    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 32, INTEL_CMAT_UINT8, INTEL_CMAT_UINT8, INTEL_CMAT_UINT32, INTEL_CMAT_UINT32 },       \
+   }
 
 static const struct intel_device_info intel_device_info_skl_gt1 = {
    GFX9_FEATURES, .gt = 1,
@@ -840,7 +846,13 @@ static const struct intel_device_info intel_device_info_cfl_gt3 = {
    .has_illegal_ccs_values = true,                    \
    .gt = _gt, .num_slices = _slices, .l3_banks = _l3, \
    .num_subslices = _subslices,                       \
-   .max_eus_per_subslice = 8
+   .max_eus_per_subslice = 8,                                         \
+   .cooperative_matrix_configurations = {                             \
+    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT16 }, \
+    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT32, INTEL_CMAT_FLOAT32 }, \
+    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 32, INTEL_CMAT_SINT8, INTEL_CMAT_SINT8, INTEL_CMAT_SINT32, INTEL_CMAT_SINT32 },       \
+    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 32, INTEL_CMAT_UINT8, INTEL_CMAT_UINT8, INTEL_CMAT_UINT32, INTEL_CMAT_UINT32 },       \
+   }
 
 #define GFX11_URB_MIN_MAX_ENTRIES                     \
    .min_entries = {                                   \
@@ -967,6 +979,12 @@ static const struct intel_device_info intel_device_info_ehl_2x4 = {
          .scanout = PAT_ENTRY(1, WC, NONE),                     \
          .writeback_incoherent = PAT_ENTRY(0, WB, 2WAY),        \
          .writecombining = PAT_ENTRY(1, WC, NONE),              \
+   },                                                           \
+   .cooperative_matrix_configurations = {                       \
+    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT16 }, \
+    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT32, INTEL_CMAT_FLOAT32 }, \
+    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 32, INTEL_CMAT_SINT8, INTEL_CMAT_SINT8, INTEL_CMAT_SINT32, INTEL_CMAT_SINT32 },       \
+    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 32, INTEL_CMAT_UINT8, INTEL_CMAT_UINT8, INTEL_CMAT_UINT32, INTEL_CMAT_UINT32 },       \
    }
 
 #define dual_subslices(args...) { args, }
@@ -1099,7 +1117,13 @@ static const struct intel_device_info intel_device_info_sg1 = {
    .has_lsc = true,                                             \
    .has_local_mem = true,                                       \
    .has_aux_map = false,                                        \
-   .simulator_id = 29
+   .simulator_id = 29,                                          \
+   .cooperative_matrix_configurations = {                       \
+    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT16 }, \
+    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT16, INTEL_CMAT_FLOAT32, INTEL_CMAT_FLOAT32 }, \
+    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 32, INTEL_CMAT_SINT8, INTEL_CMAT_SINT8, INTEL_CMAT_SINT32, INTEL_CMAT_SINT32 },       \
+    { INTEL_CMAT_SCOPE_SUBGROUP, 8, 8, 32, INTEL_CMAT_UINT8, INTEL_CMAT_UINT8, INTEL_CMAT_UINT32, INTEL_CMAT_UINT32 },       \
+   }
 
 #define DG2_FEATURES                                            \
    /* (Sub)slice info comes from the kernel topology info */    \
@@ -1430,21 +1454,29 @@ intel_get_device_info_from_pci_id(int pci_id,
 bool
 intel_device_info_compute_system_memory(struct intel_device_info *devinfo, bool update)
 {
-   uint64_t total_phys;
-   if (!os_get_total_physical_memory(&total_phys))
-      return false;
+   if (!update) {
+      if (!os_get_total_physical_memory(&devinfo->mem.sram.mappable.size))
+         return false;
+   }
 
-   uint64_t available = 0;
-   os_get_available_system_memory(&available);
-
-   if (!update)
-      devinfo->mem.sram.mappable.size = total_phys;
-   else
-      assert(devinfo->mem.sram.mappable.size == total_phys);
-
-   devinfo->mem.sram.mappable.free = available;
+   os_get_available_system_memory(&devinfo->mem.sram.mappable.free);
 
    return true;
+}
+
+static void
+intel_device_info_adjust_memory(struct intel_device_info *devinfo)
+{
+   uint64_t available;
+
+   /* Applications running without elevated privileges don't report valid
+    * numbers for free sram
+    */
+   if (os_get_available_system_memory(&available)) {
+      devinfo->mem.sram.mappable.free = MIN3(devinfo->mem.sram.mappable.free,
+                                             devinfo->mem.sram.mappable.size,
+                                             available);
+   }
 }
 
 static void
@@ -1586,7 +1618,7 @@ intel_device_info_calc_engine_prefetch(const struct intel_device_info *devinfo,
 }
 
 bool
-intel_get_device_info_from_fd(int fd, struct intel_device_info *devinfo)
+intel_get_device_info_from_fd(int fd, struct intel_device_info *devinfo, int min_ver, int max_ver)
 {
    /* Get PCI info.
     *
@@ -1607,6 +1639,12 @@ intel_get_device_info_from_fd(int fd, struct intel_device_info *devinfo)
       drmFreeDevice(&drmdev);
       return false;
    }
+   
+   if ((min_ver > 0 && devinfo->ver < min_ver) || (max_ver > 0 && devinfo->ver > max_ver)) {
+      drmFreeDevice(&drmdev);
+      return false;
+   }
+
    devinfo->pci_domain = drmdev->businfo.pci->domain;
    devinfo->pci_bus = drmdev->businfo.pci->bus;
    devinfo->pci_dev = drmdev->businfo.pci->dev;
@@ -1627,7 +1665,7 @@ intel_get_device_info_from_fd(int fd, struct intel_device_info *devinfo)
       return false;
    }
 
-   /* remaining initializion queries the kernel for device info */
+   /* remaining initialization queries the kernel for device info */
    if (devinfo->no_hw) {
       /* Provide some sensible values for NO_HW. */
       devinfo->gtt_size =
@@ -1658,6 +1696,8 @@ intel_get_device_info_from_fd(int fd, struct intel_device_info *devinfo)
       mesa_logw("Could not query local memory size.");
       return false;
    }
+
+   intel_device_info_adjust_memory(devinfo);
 
    /* Gfx7 and older do not support EU/Subslice info */
    assert(devinfo->subslice_total >= 1 || devinfo->ver <= 7);
@@ -1690,7 +1730,10 @@ bool intel_device_info_update_memory_info(struct intel_device_info *devinfo, int
    default:
       ret = false;
    }
-   return ret || intel_device_info_compute_system_memory(devinfo, true);
+
+   if (ret)
+      intel_device_info_adjust_memory(devinfo);
+   return ret;
 }
 
 void

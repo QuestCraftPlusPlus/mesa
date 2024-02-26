@@ -31,7 +31,6 @@
  * - main interface to GEM in the kernel
  */
 
-#include <xf86drm.h>
 #include <util/u_atomic.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -72,6 +71,7 @@
 #include "xe/iris_bufmgr.h"
 
 #include "drm-uapi/i915_drm.h"
+#include <xf86drm.h>
 
 #ifdef HAVE_VALGRIND
 #include <valgrind.h>
@@ -178,8 +178,6 @@ struct iris_memregion {
 
 struct iris_slab {
    struct pb_slab base;
-
-   unsigned entry_size;
 
    /** The BO representing the entire slab */
    struct iris_bo *bo;
@@ -793,7 +791,8 @@ iris_slab_alloc(void *priv,
 
    slab->base.num_entries = slab_size / entry_size;
    slab->base.num_free = slab->base.num_entries;
-   slab->entry_size = entry_size;
+   slab->base.group_index = group_index;
+   slab->base.entry_size = entry_size;
    slab->entries = calloc(slab->base.num_entries, sizeof(*slab->entries));
    if (!slab->entries)
       goto fail_bo;
@@ -815,8 +814,6 @@ iris_slab_alloc(void *priv,
       bo->zeroed = slab->bo->zeroed;
 
       bo->slab.entry.slab = &slab->base;
-      bo->slab.entry.group_index = group_index;
-      bo->slab.entry.entry_size = entry_size;
 
       bo->slab.real = iris_get_backing_bo(slab->bo);
 
@@ -1088,7 +1085,7 @@ alloc_fresh_bo(struct iris_bufmgr *bufmgr, uint64_t bo_size, unsigned flags)
     * be defensive in case any of those bypass the caches and end up here.
     */
    if (bo_size >= 1024 * 1024)
-      bo_size = ALIGN(bo_size, 2 * 1024 * 1024);
+      bo_size = align64(bo_size, 2 * 1024 * 1024);
 
    bo->real.heap = flags_to_heap(bufmgr, flags);
 
@@ -1185,7 +1182,7 @@ iris_bo_alloc(struct iris_bufmgr *bufmgr,
     * at this size, a multiple of the page size.
     */
    uint64_t bo_size =
-      bucket ? bucket->size : MAX2(ALIGN(size, page_size), page_size);
+      bucket ? bucket->size : MAX2(align64(size, page_size), page_size);
    enum iris_mmap_mode mmap_mode = heap_to_mmap_mode(bufmgr, heap);
 
    simple_mtx_lock(&bufmgr->lock);
@@ -1407,6 +1404,7 @@ iris_bo_gem_create_from_name(struct iris_bufmgr *bufmgr,
    bo->bufmgr = bufmgr;
    bo->gem_handle = open_arg.handle;
    bo->name = name;
+   bo->index = -1;
    bo->real.global_name = handle;
    bo->real.prime_fd = -1;
    bo->real.reusable = false;
@@ -1931,6 +1929,7 @@ iris_bo_import_dmabuf(struct iris_bufmgr *bufmgr, int prime_fd,
 
    bo->bufmgr = bufmgr;
    bo->name = "prime";
+   bo->index = -1;
    bo->real.reusable = false;
    bo->real.imported = true;
    /* Xe KMD expects at least 1-way coherency for imports */
@@ -2479,7 +2478,7 @@ iris_bufmgr_get_for_fd(int fd, bool bo_reuse)
       }
    }
 
-   if (!intel_get_device_info_from_fd(fd, &devinfo))
+   if (!intel_get_device_info_from_fd(fd, &devinfo, 8, -1))
       return NULL;
 
    if (devinfo.ver < 8 || devinfo.platform == INTEL_PLATFORM_CHV)

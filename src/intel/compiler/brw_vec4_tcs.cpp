@@ -447,9 +447,10 @@ brw_compile_tcs(const struct brw_compiler *compiler,
    }
 
    if (is_scalar) {
+      const unsigned dispatch_width = devinfo->ver >= 20 ? 16 : 8;
       fs_visitor v(compiler, &params->base, &key->base,
-                   &prog_data->base.base, nir, 8, params->base.stats != NULL,
-                   debug_enabled);
+                   &prog_data->base.base, nir, dispatch_width,
+                   params->base.stats != NULL, debug_enabled);
       if (!v.run_tcs()) {
          params->base.error_str =
             ralloc_strdup(params->base.mem_ctx, v.fail_msg);
@@ -469,7 +470,7 @@ brw_compile_tcs(const struct brw_compiler *compiler,
                                         nir->info.name));
       }
 
-      g.generate_code(v.cfg, 8, v.shader_stats,
+      g.generate_code(v.cfg, dispatch_width, v.shader_stats,
                       v.performance_analysis.require(), params->base.stats);
 
       g.add_const_data(nir->constant_data, nir->constant_data_size);

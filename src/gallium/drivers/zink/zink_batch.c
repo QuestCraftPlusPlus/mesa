@@ -446,6 +446,18 @@ get_batch_state(struct zink_context *ctx, struct zink_batch *batch)
       if (bs == ctx->last_free_batch_state)
          ctx->last_free_batch_state = NULL;
    }
+   /* try from the ones that are given back to the screen next */
+   if (!bs) {
+      simple_mtx_lock(&screen->free_batch_states_lock);
+      if (screen->free_batch_states) {
+         bs = screen->free_batch_states;
+         bs->ctx = ctx;
+         screen->free_batch_states = bs->next;
+         if (bs == screen->last_free_batch_state)
+            screen->last_free_batch_state = NULL;
+      }
+      simple_mtx_unlock(&screen->free_batch_states_lock);
+   }
    if (!bs && ctx->batch_states) {
       /* states are stored sequentially, so if the first one doesn't work, none of them will */
       if (zink_screen_check_last_finished(screen, ctx->batch_states->fence.batch_id) ||
@@ -884,11 +896,11 @@ static int
 batch_find_resource(struct zink_batch_state *bs, struct zink_resource_object *obj, struct zink_batch_obj_list *list)
 {
    unsigned hash = obj->bo->unique_id & (BUFFER_HASHLIST_SIZE-1);
-   int i = bs->buffer_indices_hashlist[hash];
+   int buffer_index = bs->buffer_indices_hashlist[hash];
 
    /* not found or found */
-   if (i < 0 || (i < list->num_buffers && list->objs[i] == obj))
-      return i;
+   if (buffer_index < 0 || (buffer_index < list->num_buffers && list->objs[buffer_index] == obj))
+      return buffer_index;
 
    /* Hash collision, look for the BO in the list of list->objs linearly. */
    for (int i = list->num_buffers - 1; i >= 0; i--) {
