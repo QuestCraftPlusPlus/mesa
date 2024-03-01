@@ -16,7 +16,6 @@ nvk_files = files(
   'nvk_cmd_pool.c',
   'nvk_cmd_pool.h',
   'nvk_codegen.c',
-  'nvk_compute_pipeline.c',
   'nvk_descriptor_set.h',
   'nvk_descriptor_set.c',
   'nvk_descriptor_set_layout.c',
@@ -31,7 +30,6 @@ nvk_files = files(
   'nvk_event.h',
   'nvk_format.c',
   'nvk_format.h',
-  'nvk_graphics_pipeline.c',
   'nvk_heap.c',
   'nvk_heap.h',
   'nvk_image.c',
@@ -45,8 +43,6 @@ nvk_files = files(
   'nvk_nir_lower_descriptors.c',
   'nvk_physical_device.c',
   'nvk_physical_device.h',
-  'nvk_pipeline.c',
-  'nvk_pipeline.h',
   'nvk_private.h',
   'nvk_query_pool.c',
   'nvk_query_pool.h',
@@ -57,6 +53,8 @@ nvk_files = files(
   'nvk_sampler.h',
   'nvk_shader.c',
   'nvk_shader.h',
+  'nvk_upload_queue.c',
+  'nvk_upload_queue.h',
   'nvk_wsi.c',
   'nvk_wsi.h'
 )
@@ -126,7 +124,7 @@ nouveau_icd = custom_target(
   output : 'nouveau_icd.@0@.json'.format(host_machine.cpu()),
   command : [
     prog_python, '@INPUT0@',
-    '--api-version', '1.1', '--xml', '@INPUT1@',
+    '--api-version', '1.3', '--xml', '@INPUT1@',
     '--lib-path', join_paths(icd_lib_path, icd_file_name),
     '--out', '@OUTPUT@',
   ],
@@ -144,7 +142,7 @@ if meson.version().version_compare('>= 0.58')
     output : _dev_icdname,
     command : [
       prog_python, '@INPUT0@',
-      '--api-version', '1.1', '--xml', '@INPUT1@',
+      '--api-version', '1.3', '--xml', '@INPUT1@',
       '--lib-path', meson.current_build_dir() / icd_file_name,
       '--out', '@OUTPUT@',
     ],

@@ -22,7 +22,7 @@
 .formatting-check:
   # Cancel job if a newer commit is pushed to the same branch
   interruptible: true
-  stage: lint
+  stage: code-validation
   extends:
     - .use-debian/x86_64_build
   variables:
@@ -43,19 +43,28 @@ rustfmt:
     - rustfmt --verbose src/**/lib.rs
     - rustfmt --verbose src/**/main.rs
 
-clang-format:
+.test-check:
+  # Cancel job if a newer commit is pushed to the same branch
+  interruptible: true
+  stage: code-validation
   extends:
-    - .formatting-check
-    - .lint-clang-format-rules
+    - .use-debian/x86_64_build
   variables:
-    LLVM_VERSION: 15
-  before_script:
-    - shopt -s globstar
-    # We need a meson build dir, but its config doesn't actually matter, so
-    # let's just use the default.
-    - meson setup build
-    - clang-format-${LLVM_VERSION} --version
-    - ninja -C build clang-format
+    GIT_STRATEGY: fetch
+  timeout: 10m
+
+python-test:
+  extends:
+    - .test-check
+  script:
+    - cd bin/ci
+    - pip install --break-system-packages -r test/requirements.txt
+    - PYTHONPATH=. pytest -v
+  rules:
+    - !reference [.disable-farm-mr-rules, rules]
+    - !reference [.never-post-merge-rules, rules]
+    - changes:
+        - bin/ci/**/*
 
 .test-gl:
   extends:
@@ -278,7 +287,7 @@ clang-format:
   # like FDO_DISTRIBUTION_TAG for *the* image, there is no way to
   # depend on more than one image per job. So, the job container is
   # built as part of the CI in the boot2container project.
-  image: registry.freedesktop.org/gfx-ci/ci-tron/mesa-trigger:2023-06-02.1
+  image: registry.freedesktop.org/gfx-ci/ci-tron/mesa-trigger:2024-01-05.1
   timeout: 1h 40m
   rules:
     - if: $FORCE_KERNEL_TAG != null

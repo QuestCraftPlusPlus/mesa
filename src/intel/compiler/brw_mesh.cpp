@@ -359,7 +359,7 @@ brw_compile_task(const struct brw_compiler *compiler,
    }
 
    fs_generator g(compiler, &params->base, &prog_data->base.base,
-                  false, MESA_SHADER_TASK);
+                  MESA_SHADER_TASK);
    if (unlikely(debug_enabled)) {
       g.enable_debug(ralloc_asprintf(params->base.mem_ctx,
                                      "%s task shader %s",
@@ -1333,9 +1333,9 @@ brw_can_pack_primitive_indices(nir_shader *nir, struct index_packing_state *stat
       return true;
 
    ASSERTED const struct glsl_type *type = state->original_prim_indices->type;
-   assert(type->is_array());
-   assert(type->without_array()->is_vector());
-   assert(type->without_array()->vector_elements == state->vertices_per_primitive);
+   assert(glsl_type_is_array(type));
+   assert(glsl_type_is_vector(glsl_without_array(type)));
+   assert(glsl_without_array(type)->vector_elements == state->vertices_per_primitive);
 
    nir_foreach_function_impl(impl, nir) {
       nir_foreach_block(block, impl) {
@@ -1590,7 +1590,7 @@ brw_compile_mesh(const struct brw_compiler *compiler,
    }
 
    fs_generator g(compiler, &params->base, &prog_data->base.base,
-                  false, MESA_SHADER_MESH);
+                  MESA_SHADER_MESH);
    if (unlikely(debug_enabled)) {
       g.enable_debug(ralloc_asprintf(params->base.mem_ctx,
                                      "%s mesh shader %s",

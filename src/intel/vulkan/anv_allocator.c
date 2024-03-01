@@ -378,7 +378,8 @@ anv_block_pool_init(struct anv_block_pool *pool,
       ANV_BO_ALLOC_FIXED_ADDRESS |
       ANV_BO_ALLOC_MAPPED |
       ANV_BO_ALLOC_HOST_CACHED_COHERENT |
-      ANV_BO_ALLOC_CAPTURE;
+      ANV_BO_ALLOC_CAPTURE |
+      ANV_BO_ALLOC_INTERNAL;
 
    result = anv_block_pool_expand_range(pool, initial_size);
    if (result != VK_SUCCESS)
@@ -994,6 +995,7 @@ anv_state_stream_init(struct anv_state_stream *stream,
     */
    stream->next = block_size;
 
+   stream->total_size = 0;
    util_dynarray_init(&stream->all_blocks, NULL);
 
    VG(VALGRIND_CREATE_MEMPOOL(stream, 0, false));
@@ -1036,6 +1038,7 @@ anv_state_stream_alloc(struct anv_state_stream *stream,
       /* Reset back to the start */
       stream->next = offset = 0;
       assert(offset + size <= stream->block.alloc_size);
+      stream->total_size += block_size;
    }
    const bool new_block = stream->next == 0;
 
@@ -1262,7 +1265,8 @@ anv_scratch_pool_alloc(struct anv_device *device, struct anv_scratch_pool *pool,
     * so nothing will ever touch the top page.
     */
    const enum anv_bo_alloc_flags alloc_flags =
-      devinfo->verx10 < 125 ? ANV_BO_ALLOC_32BIT_ADDRESS : 0;
+      ANV_BO_ALLOC_INTERNAL |
+      (devinfo->verx10 < 125 ? ANV_BO_ALLOC_32BIT_ADDRESS : 0);
    VkResult result = anv_device_alloc_bo(device, "scratch", size,
                                          alloc_flags,
                                          0 /* explicit_address */,
@@ -1395,7 +1399,7 @@ anv_bo_vma_alloc_or_close(struct anv_device *device,
    /* If we're using the AUX map, make sure we follow the required
     * alignment.
     */
-   if (device->info->has_aux_map && (alloc_flags & ANV_BO_ALLOC_DEDICATED))
+   if (alloc_flags & ANV_BO_ALLOC_AUX_TT_ALIGNED)
       align = MAX2(intel_aux_map_get_alignment(device->aux_map_ctx), align);
 
    /* Opportunistically align addresses to 2Mb when above 1Mb. We do this
@@ -1431,7 +1435,8 @@ anv_bo_get_mmap_mode(struct anv_device *device, struct anv_bo *bo)
       return anv_device_get_pat_entry(device, alloc_flags)->mmap;
 
    if (anv_physical_device_has_vram(device->physical)) {
-      if (alloc_flags & ANV_BO_ALLOC_NO_LOCAL_MEM)
+      if ((alloc_flags & ANV_BO_ALLOC_NO_LOCAL_MEM) ||
+          (alloc_flags & ANV_BO_ALLOC_IMPORTED))
          return INTEL_DEVICE_INFO_MMAP_MODE_WB;
 
       return INTEL_DEVICE_INFO_MMAP_MODE_WC;
@@ -1486,6 +1491,13 @@ anv_device_alloc_bo(struct anv_device *device,
    /* The kernel is going to give us whole pages anyway. */
    size = align64(size, 4096);
 
+   const uint64_t ccs_offset = size;
+   if (alloc_flags & ANV_BO_ALLOC_AUX_CCS) {
+      assert(device->info->has_aux_map);
+      size += DIV_ROUND_UP(size, intel_aux_get_main_to_aux_ratio(device->aux_map_ctx));
+      size = align64(size, 4096);
+   }
+
    const struct intel_memory_class_instance *regions[2];
    uint32_t nregions = 0;
 
@@ -1527,11 +1539,10 @@ anv_device_alloc_bo(struct anv_device *device,
       .refcount = 1,
       .offset = -1,
       .size = size,
+      .ccs_offset = ccs_offset,
       .actual_size = actual_size,
       .flags = bo_flags,
       .alloc_flags = alloc_flags,
-      .vram_only = nregions == 1 &&
-                   regions[0] == device->physical->vram_non_mappable.region,
    };
 
    if (alloc_flags & ANV_BO_ALLOC_MAPPED) {
@@ -1563,6 +1574,8 @@ anv_device_alloc_bo(struct anv_device *device,
    *bo = new_bo;
 
    *bo_out = bo;
+
+   ANV_RMV(bo_allocate, device, bo);
 
    return VK_SUCCESS;
 }
@@ -1609,7 +1622,7 @@ anv_device_import_bo_from_host_ptr(struct anv_device *device,
    assert(!(alloc_flags & (ANV_BO_ALLOC_MAPPED |
                            ANV_BO_ALLOC_HOST_CACHED |
                            ANV_BO_ALLOC_HOST_COHERENT |
-                           ANV_BO_ALLOC_DEDICATED |
+                           ANV_BO_ALLOC_AUX_CCS |
                            ANV_BO_ALLOC_PROTECTED |
                            ANV_BO_ALLOC_FIXED_ADDRESS)));
    assert(alloc_flags & ANV_BO_ALLOC_EXTERNAL);
@@ -1665,8 +1678,7 @@ anv_device_import_bo_from_host_ptr(struct anv_device *device,
 
       __sync_fetch_and_add(&bo->refcount, 1);
    } else {
-      /* Makes sure that userptr gets WB+1way host caching */
-      alloc_flags |= (ANV_BO_ALLOC_HOST_CACHED_COHERENT | ANV_BO_ALLOC_NO_LOCAL_MEM);
+      alloc_flags |= ANV_BO_ALLOC_IMPORTED;
       struct anv_bo new_bo = {
          .name = "host-ptr",
          .gem_handle = gem_handle,
@@ -1696,6 +1708,8 @@ anv_device_import_bo_from_host_ptr(struct anv_device *device,
       }
 
       *bo = new_bo;
+
+      ANV_RMV(bo_allocate, device, bo);
    }
 
    pthread_mutex_unlock(&cache->mutex);
@@ -1756,8 +1770,7 @@ anv_device_import_bo(struct anv_device *device,
 
       __sync_fetch_and_add(&bo->refcount, 1);
    } else {
-      /* so imported bos get WB+1way host caching */
-      alloc_flags |= (ANV_BO_ALLOC_HOST_CACHED_COHERENT | ANV_BO_ALLOC_NO_LOCAL_MEM);
+      alloc_flags |= ANV_BO_ALLOC_IMPORTED;
       struct anv_bo new_bo = {
          .name = "imported",
          .gem_handle = gem_handle,
@@ -1790,6 +1803,8 @@ anv_device_import_bo(struct anv_device *device,
       }
 
       *bo = new_bo;
+
+      ANV_RMV(bo_allocate, device, bo);
    }
 
    bo->flags = bo_flags;
@@ -1888,6 +1903,8 @@ anv_device_release_bo(struct anv_device *device,
    if (atomic_dec_not_one(&bo->refcount))
       return;
 
+   ANV_RMV(bo_destroy, device, bo);
+
    pthread_mutex_lock(&cache->mutex);
 
    /* We are probably the last reference since our attempt to decrement above
@@ -1901,12 +1918,6 @@ anv_device_release_bo(struct anv_device *device,
       return;
    }
    assert(bo->refcount == 0);
-
-   /* Unmap the entire BO. In the case that some addresses lacked an aux-map
-    * entry, the unmapping function will add table entries for them.
-    */
-   if (anv_bo_allows_aux_map(device, bo))
-      intel_aux_map_unmap_range(device->aux_map_ctx, bo->offset, bo->size);
 
    /* Memset the BO just in case.  The refcount being zero should be enough to
     * prevent someone from assuming the data is valid but it's safer to just

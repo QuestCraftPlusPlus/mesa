@@ -74,7 +74,7 @@ saturate_propagation_test::saturate_propagation_test()
 
    bld = fs_builder(v).at_end();
 
-   devinfo->ver = 6;
+   devinfo->ver = 9;
    devinfo->verx10 = devinfo->ver * 10;
 }
 
@@ -108,7 +108,7 @@ saturate_propagation(fs_visitor *v)
       v->cfg->dump();
    }
 
-   bool ret = v->opt_saturate_propagation();
+   bool ret = brw_fs_opt_saturate_propagation(*v);
 
    if (print) {
       fprintf(stderr, "\n= After =\n");

@@ -82,24 +82,7 @@ __instruction_case(struct encode_state *s, struct ir3_instruction *instr)
 	 * decoding and split up things which are logically different
 	 * instructions
 	 */
-	if (instr->opc == OPC_B) {
-		switch (instr->cat0.brtype) {
-		case BRANCH_PLAIN:
-			return OPC_BR;
-		case BRANCH_OR:
-			return OPC_BRAO;
-		case BRANCH_AND:
-			return OPC_BRAA;
-		case BRANCH_CONST:
-			return OPC_BRAC;
-		case BRANCH_ANY:
-			return OPC_BANY;
-		case BRANCH_ALL:
-			return OPC_BALL;
-		case BRANCH_X:
-			return OPC_BRAX;
-		}
-	} else if (instr->opc == OPC_MOV) {
+	if (instr->opc == OPC_MOV) {
 		struct ir3_register *src = instr->srcs[0];
 		if (src->flags & IR3_REG_IMMED) {
 			return OPC_MOV_IMMED;
@@ -309,14 +292,14 @@ __cat3_src_case(struct encode_state *s, struct ir3_register *reg)
 }
 
 typedef enum {
-   STC_DST_IMM,
-   STC_DST_A1
+   CONST_DST_IMM,
+   CONST_DST_A1
 } stc_dst_t;
 
 static inline stc_dst_t
-__stc_dst_case(struct encode_state *s, struct ir3_instruction *instr)
+__const_dst_case(struct encode_state *s, struct ir3_instruction *instr)
 {
-   return (instr->flags & IR3_INSTR_A1EN) ? STC_DST_A1 : STC_DST_IMM;
+   return (instr->flags & IR3_INSTR_A1EN) ? CONST_DST_A1 : CONST_DST_IMM;
 }
 
 #include "encode.h"

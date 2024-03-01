@@ -322,7 +322,7 @@ struct si_resource {
    uint32_t _pad;
 
    /* Winsys objects. */
-   struct pb_buffer *buf;
+   struct pb_buffer_lean *buf;
    uint64_t gpu_address;
 
    /* Resource properties. */
@@ -438,7 +438,7 @@ struct si_texture {
  */
 struct si_auxiliary_texture {
    struct threaded_resource b;
-   struct pb_buffer *buffer;
+   struct pb_buffer_lean *buffer;
    uint32_t offset;
    uint32_t stride;
 };
@@ -529,7 +529,7 @@ union si_mmio_counters {
 
 struct si_memory_object {
    struct pipe_memory_object b;
-   struct pb_buffer *buf;
+   struct pb_buffer_lean *buf;
    uint32_t stride;
 };
 
@@ -670,7 +670,6 @@ struct si_screen {
    } barrier_flags;
 
    simple_mtx_t shader_parts_mutex;
-   struct si_shader_part *vs_prologs;
    struct si_shader_part *tcs_epilogs;
    struct si_shader_part *ps_prologs;
    struct si_shader_part *ps_epilogs;
@@ -715,7 +714,7 @@ struct si_screen {
 
    /* NGG streamout. */
    simple_mtx_t gds_mutex;
-   struct pb_buffer *gds_oa;
+   struct pb_buffer_lean *gds_oa;
 };
 
 struct si_compute {
@@ -1122,8 +1121,8 @@ struct si_context {
    struct si_vertex_elements *vertex_elements;
    unsigned num_vertex_elements;
    unsigned cs_max_waves_per_sh;
-   bool uses_nontrivial_vs_prolog;
-   bool force_trivial_vs_prolog;
+   bool uses_nontrivial_vs_inputs;
+   bool force_trivial_vs_inputs;
    bool do_update_shaders;
    bool compute_shaderbuf_sgprs_dirty;
    bool compute_image_sgprs_dirty;
@@ -1160,6 +1159,7 @@ struct si_context {
 
    /* Vertex buffers. */
    bool vertex_buffers_dirty;
+   uint8_t num_vertex_buffers;
    uint16_t vertex_buffer_unaligned; /* bitmask of not dword-aligned buffers */
    struct pipe_vertex_buffer vertex_buffer[SI_NUM_VERTEX_BUFFERS];
 
@@ -1420,7 +1420,7 @@ void si_gfx_blit(struct pipe_context *ctx, const struct pipe_blit_info *info);
 bool si_nir_is_output_const_if_tex_is_const(struct nir_shader *shader, float *in, float *out, int *texunit);
 
 /* si_buffer.c */
-bool si_cs_is_buffer_referenced(struct si_context *sctx, struct pb_buffer *buf,
+bool si_cs_is_buffer_referenced(struct si_context *sctx, struct pb_buffer_lean *buf,
                                 unsigned usage);
 void *si_buffer_map(struct si_context *sctx, struct si_resource *resource,
                     unsigned usage);
@@ -1433,7 +1433,7 @@ struct si_resource *si_aligned_buffer_create(struct pipe_screen *screen, unsigne
                                              unsigned usage, unsigned size, unsigned alignment);
 struct pipe_resource *si_buffer_from_winsys_buffer(struct pipe_screen *screen,
                                                    const struct pipe_resource *templ,
-                                                   struct pb_buffer *imported_buf,
+                                                   struct pb_buffer_lean *imported_buf,
                                                    uint64_t offset);
 void si_replace_buffer_storage(struct pipe_context *ctx, struct pipe_resource *dst,
                                struct pipe_resource *src, unsigned num_rebinds,
@@ -1673,8 +1673,6 @@ void *si_create_clear_buffer_rmw_cs(struct si_context *sctx);
 void *si_clear_render_target_shader(struct si_context *sctx, enum pipe_texture_target type);
 void *si_clear_12bytes_buffer_shader(struct si_context *sctx);
 void *si_create_fmask_expand_cs(struct si_context *sctx, unsigned num_samples, bool is_array);
-
-/* si_shaderlib_tgsi.c */
 void *si_create_query_result_cs(struct si_context *sctx);
 void *gfx11_create_sh_query_result_cs(struct si_context *sctx);
 
@@ -2153,20 +2151,19 @@ static inline void si_set_clip_discard_distance(struct si_context *sctx, float d
  * It's expected that hw_vs and ngg are inline constants in draw_vbo after optimizations.
  */
 static inline void
-si_update_ngg_prim_state_sgpr(struct si_context *sctx, struct si_shader *hw_vs, bool ngg)
+si_update_ngg_sgpr_state_provoking_vtx(struct si_context *sctx, struct si_shader *hw_vs, bool ngg)
 {
-   if (!ngg || !hw_vs)
-      return;
-
-   if (hw_vs->uses_vs_state_provoking_vertex) {
-      unsigned vtx_index = sctx->queued.named.rasterizer->flatshade_first ? 0 : sctx->gs_out_prim;
-
-      SET_FIELD(sctx->current_gs_state, GS_STATE_PROVOKING_VTX_INDEX, vtx_index);
+   if (ngg && hw_vs && hw_vs->uses_vs_state_provoking_vertex) {
+      SET_FIELD(sctx->current_gs_state, GS_STATE_PROVOKING_VTX_FIRST,
+                sctx->queued.named.rasterizer->flatshade_first);
    }
+}
 
-   if (hw_vs->uses_gs_state_outprim) {
+static inline void
+si_update_ngg_sgpr_state_out_prim(struct si_context *sctx, struct si_shader *hw_vs, bool ngg)
+{
+   if (ngg && hw_vs && hw_vs->uses_gs_state_outprim)
       SET_FIELD(sctx->current_gs_state, GS_STATE_OUTPRIM, sctx->gs_out_prim);
-   }
 }
 
 /* Set the primitive type seen by the rasterizer. GS and tessellation affect this.
@@ -2197,7 +2194,7 @@ si_set_rasterized_prim(struct si_context *sctx, enum mesa_prim rast_prim,
 
       sctx->current_rast_prim = rast_prim;
       si_vs_ps_key_update_rast_prim_smooth_stipple(sctx);
-      si_update_ngg_prim_state_sgpr(sctx, hw_vs, ngg);
+      si_update_ngg_sgpr_state_out_prim(sctx, hw_vs, ngg);
    }
 }
 

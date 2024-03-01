@@ -20,8 +20,6 @@
 #include "vn_renderer.h"
 #include "vn_ring.h"
 
-#define VN_INSTANCE_RING_SIZE (128 * 1024)
-
 /*
  * Instance extensions add instance-level or physical-device-level
  * functionalities.  It seems renderer support is either unnecessary or
@@ -49,6 +47,9 @@ static const struct vk_instance_extension_table
 #endif
 #ifdef VK_USE_PLATFORM_XLIB_KHR
       .KHR_xlib_surface = true,
+#endif
+#ifndef VK_USE_PLATFORM_WIN32_KHR
+      .EXT_headless_surface = true,
 #endif
    };
 
@@ -118,6 +119,10 @@ vn_instance_fini_ring(struct vn_instance *instance)
 
    vn_watchdog_fini(&instance->ring.watchdog);
 
+   list_for_each_entry_safe(struct vn_tls_ring, tls_ring,
+                            &instance->ring.tls_rings, vk_head)
+      vn_tls_destroy_ring(tls_ring);
+
    vn_ring_destroy(instance->ring.ring);
 }
 
@@ -126,12 +131,21 @@ vn_instance_init_ring(struct vn_instance *instance)
 {
    /* 32-bit seqno for renderer roundtrips */
    static const size_t extra_size = sizeof(uint32_t);
-   struct vn_ring_layout layout;
-   vn_ring_get_layout(VN_INSTANCE_RING_SIZE, extra_size, &layout);
 
-   instance->ring.ring = vn_ring_create(instance, &layout);
+   /* default instance ring size */
+   static const size_t buf_size = 128 * 1024;
+
+   /* order of 4 for performant async cmd enqueue */
+   static const uint8_t direct_order = 4;
+
+   struct vn_ring_layout layout;
+   vn_ring_get_layout(buf_size, extra_size, &layout);
+
+   instance->ring.ring = vn_ring_create(instance, &layout, direct_order);
    if (!instance->ring.ring)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   list_inithead(&instance->ring.tls_rings);
 
    vn_watchdog_init(&instance->ring.watchdog);
 
@@ -199,12 +213,6 @@ vn_instance_init_renderer(struct vn_instance *instance)
              renderer_info->vk_ext_command_serialization_spec_version);
       vn_log(instance, "VK_MESA_venus_protocol spec version %d",
              renderer_info->vk_mesa_venus_protocol_spec_version);
-      vn_log(instance, "supports blob id 0: %d",
-             renderer_info->supports_blob_id_0);
-      vn_log(instance, "allow_vk_wait_syncs: %d",
-             renderer_info->allow_vk_wait_syncs);
-      vn_log(instance, "supports_multiple_timelines: %d",
-             renderer_info->supports_multiple_timelines);
    }
 
    return VK_SUCCESS;
@@ -379,6 +387,11 @@ vn_CreateInstance(const VkInstanceCreateInfo *pCreateInfo,
    if (VN_DEBUG(INIT)) {
       vn_log(instance, "supports multi-plane wsi format modifiers: %s",
              instance->enable_wsi_multi_plane_modifiers ? "yes" : "no");
+   }
+
+   const char *engine_name = instance->base.base.app_info.engine_name;
+   if (engine_name) {
+      instance->engine_is_zink = strcmp(engine_name, "mesa zink") == 0;
    }
 
    *pInstance = instance_handle;

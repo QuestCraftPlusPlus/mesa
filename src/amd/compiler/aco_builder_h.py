@@ -97,6 +97,13 @@ ds_pattern_bitmode(unsigned and_mask, unsigned or_mask, unsigned xor_mask)
     return and_mask | (or_mask << 5) | (xor_mask << 10);
 }
 
+inline unsigned
+ds_pattern_rotate(unsigned delta, unsigned mask)
+{
+    assert(delta < 32 && mask < 32);
+    return mask | (delta << 5) | 0xc000;
+}
+
 aco_ptr<Instruction> create_s_mov(Definition dst, Operand src);
 
 enum sendmsg {
@@ -571,6 +578,7 @@ formats = [("pseudo", [Format.PSEUDO], 'Pseudo_instruction', list(itertools.prod
            ("vopc_sdwa", [Format.VOPC, Format.SDWA], 'SDWA_instruction', itertools.product([1, 2], [2])),
            ("vop3", [Format.VOP3], 'VALU_instruction', [(1, 3), (1, 2), (1, 1), (2, 2)]),
            ("vop3p", [Format.VOP3P], 'VALU_instruction', [(1, 2), (1, 3)]),
+           ("vopd", [Format.VOPD], 'VOPD_instruction', [(2, 2), (2, 3), (2, 4), (2, 5), (2, 6)]),
            ("vinterp_inreg", [Format.VINTERP_INREG], 'VINTERP_inreg_instruction', [(1, 3)]),
            ("vintrp", [Format.VINTRP], 'VINTRP_instruction', [(1, 2), (1, 3)]),
            ("vop1_dpp", [Format.VOP1, Format.DPP16], 'DPP16_instruction', [(1, 1)]),

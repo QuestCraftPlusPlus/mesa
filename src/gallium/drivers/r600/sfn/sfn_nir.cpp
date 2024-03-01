@@ -443,7 +443,7 @@ r600_nir_lower_atomics(nir_shader *shader)
    std::map<unsigned, nir_variable *> sorted_var;
 
    nir_foreach_variable_with_modes_safe(var, shader, nir_var_uniform) {
-      if (var->type->contains_atomic()) {
+      if (glsl_contains_atomic(var->type)) {
          sorted_var[(var->data.binding << 16) | var->data.offset] = var;
          exec_node_remove(&var->node);
       }
@@ -451,7 +451,7 @@ r600_nir_lower_atomics(nir_shader *shader)
 
    for (auto& [dummy, var] : sorted_var) {
       auto iindex = binding_offset.find(var->data.binding);
-      unsigned offset_update = var->type->atomic_size() / 4; /* ATOMIC_COUNTER_SIZE */
+      unsigned offset_update = glsl_atomic_size(var->type) / 4; /* ATOMIC_COUNTER_SIZE */
       if (iindex == binding_offset.end()) {
          var->data.index = 0;
          binding_offset[var->data.binding] = offset_update;
@@ -647,7 +647,7 @@ optimize_once(nir_shader *shader)
    NIR_PASS(progress, shader, nir_opt_copy_prop_vars);
    NIR_PASS(progress, shader, nir_opt_remove_phis);
 
-   if (nir_opt_trivial_continues(shader)) {
+   if (nir_opt_loop(shader)) {
       progress = true;
       NIR_PASS(progress, shader, nir_copy_prop);
       NIR_PASS(progress, shader, nir_opt_dce);
@@ -762,6 +762,7 @@ r600_lower_and_optimize_nir(nir_shader *sh,
       ((sh->info.bit_sizes_float | sh->info.bit_sizes_int) & 64);
 
    r600::sort_uniforms(sh);
+   NIR_PASS_V(sh, r600_nir_fix_kcache_indirect_access);
 
    while (optimize_once(sh))
       ;

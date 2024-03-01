@@ -70,7 +70,7 @@ radv_create_buffer(struct radv_device *device, const VkBufferCreateInfo *pCreate
 
    assert(pCreateInfo->sType == VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
 
-#ifdef ANDROID
+#if DETECT_OS_ANDROID
    /* reject buffers that are larger than maxBufferSize on Android, which
     * might not have VK_KHR_maintenance4
     */
@@ -143,6 +143,10 @@ radv_BindBufferMemory2(VkDevice _device, uint32_t bindInfoCount, const VkBindBuf
    for (uint32_t i = 0; i < bindInfoCount; ++i) {
       RADV_FROM_HANDLE(radv_device_memory, mem, pBindInfos[i].memory);
       RADV_FROM_HANDLE(radv_buffer, buffer, pBindInfos[i].buffer);
+      VkBindMemoryStatusKHR *status = (void *)vk_find_struct_const(&pBindInfos[i], BIND_MEMORY_STATUS_KHR);
+
+      if (status)
+         *status->pResult = VK_SUCCESS;
 
       if (mem->alloc_size) {
          VkBufferMemoryRequirementsInfo2 info = {
@@ -156,6 +160,8 @@ radv_BindBufferMemory2(VkDevice _device, uint32_t bindInfoCount, const VkBindBuf
          vk_common_GetBufferMemoryRequirements2(_device, &info, &reqs);
 
          if (pBindInfos[i].memoryOffset + reqs.memoryRequirements.size > mem->alloc_size) {
+            if (status)
+               *status->pResult = VK_ERROR_UNKNOWN;
             return vk_errorf(device, VK_ERROR_UNKNOWN, "Device memory object too small for the buffer.\n");
          }
       }
@@ -184,7 +190,7 @@ radv_get_buffer_memory_requirements(struct radv_device *device, VkDeviceSize siz
     * vkGetGeneratedCommandsMemoryRequirementsNV. (we have to make sure their
     * intersection is non-zero at least)
     */
-   if ((usage & VK_BUFFER_USAGE_2_INDIRECT_BUFFER_BIT_KHR) && device->uses_device_generated_commands)
+   if ((usage & VK_BUFFER_USAGE_2_INDIRECT_BUFFER_BIT_KHR) && radv_uses_device_generated_commands(device))
       pMemoryRequirements->memoryRequirements.memoryTypeBits |= device->physical_device->memory_types_32bit;
 
    /* Force 32-bit address-space for descriptor buffers usage because they are passed to shaders

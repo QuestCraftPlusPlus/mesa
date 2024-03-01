@@ -38,7 +38,7 @@
 _CRTIMP int _vscprintf(const char *format, va_list argptr);
 #endif
 
-static const char*
+const char*
 util_printf_prev_tok(const char *str)
 {
    while (*str != '%')
@@ -229,7 +229,7 @@ u_printf_impl(FILE *out, const char *buffer, size_t buffer_size,
          free(print_str);
 
          buf_pos += arg_size;
-         buf_pos = ALIGN(buf_pos, 4);
+         buf_pos = align_uintptr(buf_pos, 4);
       }
 
       /* print remaining */

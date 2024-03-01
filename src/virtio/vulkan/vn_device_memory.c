@@ -120,7 +120,7 @@ vn_device_memory_pool_grow_alloc(struct vn_device *dev,
    if (!mem)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
-   vn_object_set_id(mem, (uintptr_t)mem, VK_OBJECT_TYPE_DEVICE_MEMORY);
+   vn_object_set_id(mem, vn_get_next_obj_id(), VK_OBJECT_TYPE_DEVICE_MEMORY);
 
    VkResult result = vn_device_memory_alloc_simple(dev, mem, &alloc_info);
    if (result != VK_SUCCESS)
@@ -486,7 +486,7 @@ vn_device_memory_alloc(struct vn_device *dev,
 {
    struct vk_device_memory *mem_vk = &mem->base.base;
    const VkMemoryType *mem_type = &dev->physical_device->memory_properties
-                                    .memoryTypes[mem_vk->memory_type_index];
+                                      .memoryTypes[mem_vk->memory_type_index];
 
    const bool has_guest_vram = dev->renderer->info.has_guest_vram;
    const bool host_visible =
@@ -544,7 +544,7 @@ vn_device_memory_emit_report(struct vn_device *dev,
                                       .memoryTypes[mem_vk->memory_type_index];
    vn_device_emit_device_memory_report(dev, type, mem_obj_id, mem_vk->size,
                                        VK_OBJECT_TYPE_DEVICE_MEMORY,
-                                       mem->base.id, mem_type->heapIndex);
+                                       (uintptr_t)mem, mem_type->heapIndex);
 }
 
 VkResult
@@ -553,7 +553,6 @@ vn_AllocateMemory(VkDevice device,
                   const VkAllocationCallbacks *pAllocator,
                   VkDeviceMemory *pMemory)
 {
-   VN_TRACE_FUNC();
    struct vn_device *dev = vn_device_from_handle(device);
 
    /* see vn_physical_device_init_memory_properties */
@@ -585,7 +584,7 @@ vn_AllocateMemory(VkDevice device,
    if (!mem)
       return vn_error(dev->instance, VK_ERROR_OUT_OF_HOST_MEMORY);
 
-   vn_object_set_id(mem, (uintptr_t)mem, VK_OBJECT_TYPE_DEVICE_MEMORY);
+   vn_object_set_id(mem, vn_get_next_obj_id(), VK_OBJECT_TYPE_DEVICE_MEMORY);
 
    VkResult result;
    if (mem->base.base.ahardware_buffer) {
@@ -616,7 +615,6 @@ vn_FreeMemory(VkDevice device,
               VkDeviceMemory memory,
               const VkAllocationCallbacks *pAllocator)
 {
-   VN_TRACE_FUNC();
    struct vn_device *dev = vn_device_from_handle(device);
    struct vn_device_memory *mem = vn_device_memory_from_handle(memory);
    if (!mem)
@@ -711,7 +709,6 @@ vn_MapMemory(VkDevice device,
 void
 vn_UnmapMemory(VkDevice device, VkDeviceMemory memory)
 {
-   VN_TRACE_FUNC();
 }
 
 VkResult
@@ -719,7 +716,6 @@ vn_FlushMappedMemoryRanges(VkDevice device,
                            uint32_t memoryRangeCount,
                            const VkMappedMemoryRange *pMemoryRanges)
 {
-   VN_TRACE_FUNC();
    struct vn_device *dev = vn_device_from_handle(device);
 
    for (uint32_t i = 0; i < memoryRangeCount; i++) {
@@ -742,7 +738,6 @@ vn_InvalidateMappedMemoryRanges(VkDevice device,
                                 uint32_t memoryRangeCount,
                                 const VkMappedMemoryRange *pMemoryRanges)
 {
-   VN_TRACE_FUNC();
    struct vn_device *dev = vn_device_from_handle(device);
 
    for (uint32_t i = 0; i < memoryRangeCount; i++) {

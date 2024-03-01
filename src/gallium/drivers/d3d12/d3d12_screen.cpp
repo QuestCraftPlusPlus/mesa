@@ -68,6 +68,7 @@ d3d12_debug_options[] = {
    { "res",          D3D12_DEBUG_RESOURCE,      "Debug resources" },
    { "debuglayer",   D3D12_DEBUG_DEBUG_LAYER,   "Enable debug layer" },
    { "gpuvalidator", D3D12_DEBUG_GPU_VALIDATOR, "Enable GPU validator" },
+   { "singleton",    D3D12_DEBUG_SINGLETON,     "Disallow use of device factory" },
    DEBUG_NAMED_VALUE_END
 };
 
@@ -343,6 +344,7 @@ d3d12_get_param(struct pipe_screen *pscreen, enum pipe_cap param)
    case PIPE_CAP_GL_SPIRV:
    case PIPE_CAP_POLYGON_OFFSET_CLAMP:
    case PIPE_CAP_SHADER_GROUP_VOTE:
+   case PIPE_CAP_SHADER_BALLOT:
    case PIPE_CAP_QUERY_PIPELINE_STATISTICS:
    case PIPE_CAP_QUERY_SO_OVERFLOW:
       return 1;
@@ -632,7 +634,8 @@ d3d12_is_format_supported(struct pipe_screen *pscreen,
    }
 
    if (bind & PIPE_BIND_DISPLAY_TARGET) {
-      if (!screen->winsys->is_displaytarget_format_supported(screen->winsys, bind, format))
+      enum pipe_format dt_format = format == PIPE_FORMAT_R16G16B16A16_FLOAT ? PIPE_FORMAT_R8G8B8A8_UNORM : format;
+      if (!screen->winsys->is_displaytarget_format_supported(screen->winsys, bind, dt_format))
          return false;
    }
 
@@ -765,10 +768,6 @@ d3d12_deinit_screen(struct d3d12_screen *screen)
       screen->dev->Release();
       screen->dev = nullptr;
    }
-   if (screen->winsys) {
-      screen->winsys->destroy(screen->winsys);
-      screen->winsys = nullptr;
-   }
 }
 
 void
@@ -791,6 +790,7 @@ d3d12_flush_frontbuffer(struct pipe_screen * pscreen,
                         struct pipe_resource *pres,
                         unsigned level, unsigned layer,
                         void *winsys_drawable_handle,
+                        unsigned nboxes,
                         struct pipe_box *sub_box)
 {
    struct d3d12_screen *screen = d3d12_screen(pscreen);
@@ -799,6 +799,29 @@ d3d12_flush_frontbuffer(struct pipe_screen * pscreen,
 
    if (!winsys || !pctx)
      return;
+
+   assert(res->dt || res->dt_proxy);
+   if (res->dt_proxy) {
+     struct pipe_blit_info blit;
+
+     memset(&blit, 0, sizeof(blit));
+     blit.dst.resource = res->dt_proxy;
+     blit.dst.box.width = blit.dst.resource->width0;
+     blit.dst.box.height = blit.dst.resource->height0;
+     blit.dst.box.depth = 1;
+     blit.dst.format = blit.dst.resource->format;
+     blit.src.resource = pres;
+     blit.src.box.width = blit.src.resource->width0;
+     blit.src.box.height = blit.src.resource->height0;
+     blit.src.box.depth = 1;
+     blit.src.format = blit.src.resource->format;
+     blit.mask = PIPE_MASK_RGBA;
+     blit.filter = PIPE_TEX_FILTER_NEAREST;
+
+     pctx->blit(pctx, &blit);
+     pres = res->dt_proxy;
+     res = d3d12_resource(pres);
+   }
 
    assert(res->dt);
    void *map = winsys->displaytarget_map(winsys, res->dt, 0);
@@ -829,7 +852,7 @@ d3d12_flush_frontbuffer(struct pipe_screen * pscreen,
    }
 #endif
 
-   winsys->displaytarget_display(winsys, res->dt, winsys_drawable_handle, sub_box);
+   winsys->displaytarget_display(winsys, res->dt, winsys_drawable_handle, nboxes, sub_box);
 }
 
 #ifndef _GAMING_XBOX
@@ -1385,6 +1408,7 @@ try_find_d3d12core_next_to_self(char *path, size_t path_arr_size)
       return nullptr;
    }
 
+   *(last_slash + 1) = '\0';
    return path;
 }
 #endif
@@ -1393,6 +1417,9 @@ try_find_d3d12core_next_to_self(char *path, size_t path_arr_size)
 static ID3D12DeviceFactory *
 try_create_device_factory(util_dl_library *d3d12_mod)
 {
+   if (d3d12_debug & D3D12_DEBUG_SINGLETON)
+      return nullptr;
+
    /* A device factory allows us to isolate things like debug layer enablement from other callers,
     * and can potentially even refer to a different D3D12 redist implementation from others.
     */
@@ -1561,6 +1588,7 @@ d3d12_init_screen(struct d3d12_screen *screen, IUnknown *adapter)
    screen->max_feature_level = feature_levels.MaxSupportedFeatureLevel;
 
    static const D3D_SHADER_MODEL valid_shader_models[] = {
+      D3D_SHADER_MODEL_6_8,
       D3D_SHADER_MODEL_6_7, D3D_SHADER_MODEL_6_6, D3D_SHADER_MODEL_6_5, D3D_SHADER_MODEL_6_4,
       D3D_SHADER_MODEL_6_3, D3D_SHADER_MODEL_6_2, D3D_SHADER_MODEL_6_1, D3D_SHADER_MODEL_6_0,
    };
@@ -1568,7 +1596,7 @@ d3d12_init_screen(struct d3d12_screen *screen, IUnknown *adapter)
       D3D12_FEATURE_DATA_SHADER_MODEL shader_model = { valid_shader_models[i] };
       if (SUCCEEDED(screen->dev->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &shader_model, sizeof(shader_model)))) {
          static_assert(D3D_SHADER_MODEL_6_0 == 0x60 && SHADER_MODEL_6_0 == 0x60000, "Validating math below");
-         static_assert(D3D_SHADER_MODEL_6_7 == 0x67 && SHADER_MODEL_6_7 == 0x60007, "Validating math below");
+         static_assert(D3D_SHADER_MODEL_6_8 == 0x68 && SHADER_MODEL_6_8 == 0x60008, "Validating math below");
          screen->max_shader_model = static_cast<dxil_shader_model>(((shader_model.HighestShaderModel & 0xf0) << 12) |
                                                                    (shader_model.HighestShaderModel & 0xf));
          break;

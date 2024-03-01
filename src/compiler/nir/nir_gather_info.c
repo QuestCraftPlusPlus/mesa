@@ -88,6 +88,10 @@ get_deref_info(nir_shader *shader, nir_variable *var, nir_deref_instr *deref,
             *indirect |= !nir_src_is_const((*p)->arr.index);
          } else if ((*p)->deref_type == nir_deref_type_struct) {
             /* Struct indices are always constant. */
+         }  else if ((*p)->deref_type == nir_deref_type_array_wildcard) {
+            /* Wilcards ref the whole array dimension and should get lowered
+             * to direct deref at a later point.
+             */
          } else {
             unreachable("Unsupported deref type");
          }
@@ -664,7 +668,6 @@ gather_intrinsic_info(nir_intrinsic_instr *instr, nir_shader *shader,
    case nir_intrinsic_load_barycentric_model:
    case nir_intrinsic_load_ray_launch_id:
    case nir_intrinsic_load_ray_launch_size:
-   case nir_intrinsic_load_ray_launch_size_addr_amd:
    case nir_intrinsic_load_ray_world_origin:
    case nir_intrinsic_load_ray_world_direction:
    case nir_intrinsic_load_ray_object_origin:
@@ -750,12 +753,6 @@ gather_intrinsic_info(nir_intrinsic_instr *instr, nir_shader *shader,
    case nir_intrinsic_vote_feq:
    case nir_intrinsic_vote_ieq:
    case nir_intrinsic_ballot:
-   case nir_intrinsic_ballot_bit_count_exclusive:
-   case nir_intrinsic_ballot_bit_count_inclusive:
-   case nir_intrinsic_ballot_bitfield_extract:
-   case nir_intrinsic_ballot_bit_count_reduce:
-   case nir_intrinsic_ballot_find_lsb:
-   case nir_intrinsic_ballot_find_msb:
    case nir_intrinsic_first_invocation:
    case nir_intrinsic_last_invocation:
    case nir_intrinsic_read_invocation:
@@ -768,9 +765,8 @@ gather_intrinsic_info(nir_intrinsic_instr *instr, nir_shader *shader,
    case nir_intrinsic_shuffle_xor:
    case nir_intrinsic_shuffle_up:
    case nir_intrinsic_shuffle_down:
+   case nir_intrinsic_rotate:
    case nir_intrinsic_masked_swizzle_amd:
-   case nir_intrinsic_mbcnt_amd:
-   case nir_intrinsic_write_invocation_amd:
       shader->info.uses_wide_subgroup_intrinsics = true;
 
       if (shader->info.stage == MESA_SHADER_FRAGMENT &&

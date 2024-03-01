@@ -247,8 +247,10 @@ static bool si_update_shaders(struct si_context *sctx)
 
    /* If we start to use any of these, we need to update the SGPR. */
    if ((hw_vs->uses_vs_state_provoking_vertex && !old_uses_vs_state_provoking_vertex) ||
-       (hw_vs->uses_gs_state_outprim && !old_uses_gs_state_outprim))
-      si_update_ngg_prim_state_sgpr(sctx, hw_vs, NGG);
+       (hw_vs->uses_gs_state_outprim && !old_uses_gs_state_outprim)) {
+      si_update_ngg_sgpr_state_out_prim(sctx, hw_vs, NGG);
+      si_update_ngg_sgpr_state_provoking_vtx(sctx, hw_vs, NGG);
+   }
 
    r = si_shader_select(ctx, &sctx->shader.ps);
    if (r)
@@ -313,7 +315,7 @@ static bool si_update_shaders(struct si_context *sctx)
                shader->binary.code_size,
                pipeline_code_hash);
 
-            total_size += ALIGN(shader->binary.uploaded_code_size, 256);
+            total_size += (uint32_t)align_uintptr(shader->binary.uploaded_code_size, 256);
          }
       }
 
@@ -370,9 +372,8 @@ static bool si_update_shaders(struct si_context *sctx)
 
                   struct si_pm4_state *pm4 = &shader->pm4;
 
-                  uint32_t va_low = (pipeline->bo->gpu_address + pipeline->offset[i]) >> 8;
-                  assert(PKT3_IT_OPCODE_G(pm4->pm4[pm4->reg_va_low_idx - 2]) == PKT3_SET_SH_REG);
-                  uint32_t reg = (pm4->pm4[pm4->reg_va_low_idx - 1] << 2) + SI_SH_REG_OFFSET;
+                  uint64_t va_low = (pipeline->bo->gpu_address + pipeline->offset[i]) >> 8;
+                  uint32_t reg = pm4->spi_shader_pgm_lo_reg;
                   si_pm4_set_reg(&pipeline->pm4, reg, va_low);
                }
             }
@@ -883,8 +884,10 @@ static unsigned si_get_ia_multi_vgt_param(struct si_context *sctx,
           sctx->family == CHIP_HAWAII && G_028AA8_SWITCH_ON_EOI(ia_multi_vgt_param) &&
           num_instanced_prims_less_than<IS_DRAW_VERTEX_STATE>(indirect, prim, min_vertex_count,
                                                               instance_count, 2, sctx->patch_vertices)) {
-         sctx->flags |= SI_CONTEXT_VGT_FLUSH;
-         si_mark_atom_dirty(sctx, &sctx->atoms.s.cache_flush);
+         /* The cache flushes should have been emitted already. */
+         assert(sctx->flags == 0);
+         sctx->flags = SI_CONTEXT_VGT_FLUSH;
+         si_emit_cache_flush_direct(sctx);
       }
    }
 
@@ -2046,7 +2049,7 @@ static void si_draw(struct pipe_context *ctx,
 
          si_compute_shorten_ubyte_buffer(sctx, indexbuf, info->index.resource,
                                          start_offset, index_offset + start, count,
-                                         SI_OP_SYNC_AFTER);
+                                         SI_OP_SKIP_CACHE_INV_BEFORE | SI_OP_SYNC_AFTER);
 
          index_offset = 0;
          index_size = 2;
@@ -2128,24 +2131,23 @@ static void si_draw(struct pipe_context *ctx,
 
    if (IS_DRAW_VERTEX_STATE) {
       /* draw_vertex_state doesn't use the current vertex buffers and vertex elements,
-       * so disable any non-trivial VS prolog that is based on them, such as vertex
-       * format lowering.
+       * so disable all VS input lowering.
        */
-      if (!sctx->force_trivial_vs_prolog) {
-         sctx->force_trivial_vs_prolog = true;
+      if (!sctx->force_trivial_vs_inputs) {
+         sctx->force_trivial_vs_inputs = true;
 
-         /* Update shaders to disable the non-trivial VS prolog. */
-         if (sctx->uses_nontrivial_vs_prolog) {
+         /* Update shaders to disable VS input lowering. */
+         if (sctx->uses_nontrivial_vs_inputs) {
             si_vs_key_update_inputs(sctx);
             sctx->do_update_shaders = true;
          }
       }
    } else {
-      if (sctx->force_trivial_vs_prolog) {
-         sctx->force_trivial_vs_prolog = false;
+      if (sctx->force_trivial_vs_inputs) {
+         sctx->force_trivial_vs_inputs = false;
 
-         /* Update shaders to enable the non-trivial VS prolog. */
-         if (sctx->uses_nontrivial_vs_prolog) {
+         /* Update shaders to possibly enable VS input lowering. */
+         if (sctx->uses_nontrivial_vs_inputs) {
             si_vs_key_update_inputs(sctx);
             sctx->do_update_shaders = true;
          }
@@ -2226,12 +2228,13 @@ static void si_draw(struct pipe_context *ctx,
 
    /* Emit states. */
    si_emit_rasterizer_prim_state<GFX_VERSION, HAS_GS, NGG>(sctx);
-   /* This must be done before si_emit_all_states because it can set cache flush flags. */
+   /* This emits states and flushes caches. */
+   si_emit_all_states(sctx, masked_atoms);
+   /* This can be done after si_emit_all_states because it doesn't set cache flush flags. */
    si_emit_draw_registers<GFX_VERSION, HAS_TESS, HAS_GS, NGG, IS_DRAW_VERTEX_STATE>
          (sctx, indirect, prim, index_size, instance_count, primitive_restart,
           info->restart_index, min_direct_count);
-   /* This emits states and flushes caches. */
-   si_emit_all_states(sctx, masked_atoms);
+
    /* <-- CUs are idle here if the cache_flush state waited. */
 
    /* This must be done after si_emit_all_states, which can affect this. */

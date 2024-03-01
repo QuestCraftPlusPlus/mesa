@@ -44,6 +44,7 @@
 #include "api_exec_decl.h"
 #include "glthread_marshal.h"
 
+#include "cso_cache/cso_context.h"
 #include "state_tracker/st_context.h"
 #include "state_tracker/st_draw.h"
 #include "util/u_draw.h"
@@ -222,18 +223,7 @@ valid_prim_mode_indexed(struct gl_context *ctx, GLenum mode)
 static GLenum
 valid_elements_type(struct gl_context *ctx, GLenum type)
 {
-   /* GL_UNSIGNED_BYTE  = 0x1401
-    * GL_UNSIGNED_SHORT = 0x1403
-    * GL_UNSIGNED_INT   = 0x1405
-    *
-    * The trick is that bit 1 and bit 2 mean USHORT and UINT, respectively.
-    * After clearing those two bits (with ~6), we should get UBYTE.
-    * Both bits can't be set, because the enum would be greater than UINT.
-    */
-   if (!(type <= GL_UNSIGNED_INT && (type & ~6) == GL_UNSIGNED_BYTE))
-      return GL_INVALID_ENUM;
-
-   return GL_NO_ERROR;
+   return _mesa_is_index_type_valid(type) ? GL_NO_ERROR : GL_INVALID_ENUM;
 }
 
 static inline bool
@@ -1017,20 +1007,6 @@ check_array_data(struct gl_context *ctx, struct gl_vertex_array_object *vao,
 }
 
 
-static inline unsigned
-get_index_size_shift(GLenum type)
-{
-   /* The type is already validated, so use a fast conversion.
-    *
-    * GL_UNSIGNED_BYTE  - GL_UNSIGNED_BYTE = 0
-    * GL_UNSIGNED_SHORT - GL_UNSIGNED_BYTE = 2
-    * GL_UNSIGNED_INT   - GL_UNSIGNED_BYTE = 4
-    *
-    * Divide by 2 to get 0,1,2.
-    */
-   return (type - GL_UNSIGNED_BYTE) >> 1;
-}
-
 /**
  * Examine the array's data for NaNs, etc.
  * For debug purposes; not normally used.
@@ -1200,7 +1176,7 @@ _mesa_draw_arrays(struct gl_context *ctx, GLenum mode, GLint start,
 
    st_prepare_draw(ctx, ST_PIPELINE_RENDER_STATE_MASK);
 
-   ctx->Driver.DrawGallium(ctx, &info, ctx->DrawID, &draw, 1);
+   ctx->Driver.DrawGallium(ctx, &info, ctx->DrawID, NULL, &draw, 1);
 
    if (MESA_DEBUG_FLAGS & DEBUG_ALWAYS_FLUSH) {
       _mesa_flush(ctx);
@@ -1507,7 +1483,7 @@ _mesa_MultiDrawArrays(GLenum mode, const GLint *first,
 
    st_prepare_draw(ctx, ST_PIPELINE_RENDER_STATE_MASK);
 
-   ctx->Driver.DrawGallium(ctx, &info, 0, draw, primcount);
+   ctx->Driver.DrawGallium(ctx, &info, 0, NULL, draw, primcount);
 
    if (MESA_DEBUG_FLAGS & DEBUG_ALWAYS_FLUSH)
       _mesa_flush(ctx);
@@ -1619,9 +1595,7 @@ _mesa_validated_drawrangeelements(struct gl_context *ctx,
       assert(end == ~0u);
    }
 
-   struct pipe_draw_info info;
-   struct pipe_draw_start_count_bias draw;
-   unsigned index_size_shift = get_index_size_shift(type);
+   unsigned index_size_shift = _mesa_get_index_size_shift(type);
 
    if (index_bo) {
       if (!indices_aligned(index_size_shift, indices))
@@ -1638,6 +1612,60 @@ _mesa_validated_drawrangeelements(struct gl_context *ctx,
          return;
       }
    }
+
+   st_prepare_draw(ctx, ST_PIPELINE_RENDER_STATE_MASK);
+
+   /* Fast path for a very common DrawElements case:
+    * - there are no user indices here (always true with glthread)
+    * - DrawGallium is st_draw_gallium (regular render mode, almost always
+    *   true), which only calls cso_context::draw_vbo
+    * - the threaded context is enabled while u_vbuf is bypassed (cso_context
+    *   always calls tc_draw_vbo, which is always true with glthread if all
+    *   vertex formats are also supported by the driver)
+    * - DrawID is 0 (true if glthread isn't unrolling an indirect multi draw,
+    *   which is almost always true)
+    */
+   struct st_context *st = st_context(ctx);
+   if (index_bo && ctx->Driver.DrawGallium == st_draw_gallium &&
+       st->cso_context->draw_vbo == tc_draw_vbo && ctx->DrawID == 0) {
+      assert(!st->draw_needs_minmax_index);
+      struct pipe_resource *index_buffer =
+         _mesa_get_bufferobj_reference(ctx, index_bo);
+      struct tc_draw_single *draw =
+         tc_add_draw_single_call(st->pipe, index_buffer);
+      bool primitive_restart = ctx->Array._PrimitiveRestart[index_size_shift];
+
+      /* This must be set exactly like u_threaded_context sets it, not like
+       * it would be set for draw_vbo.
+       */
+      draw->info.mode = mode;
+      draw->info.index_size = 1 << index_size_shift;
+      draw->info.view_mask = 0;
+      /* Packed section begin. */
+      draw->info.primitive_restart = primitive_restart;
+      draw->info.has_user_indices = false;
+      draw->info.index_bounds_valid = false;
+      draw->info.increment_draw_id = false;
+      draw->info.take_index_buffer_ownership = false;
+      draw->info.index_bias_varies = false;
+      draw->info.was_line_loop = false;
+      draw->info._pad = 0;
+      /* Packed section end. */
+      draw->info.start_instance = baseInstance;
+      draw->info.instance_count = numInstances;
+      draw->info.restart_index =
+         primitive_restart ? ctx->Array._RestartIndex[index_size_shift] : 0;
+      draw->info.index.resource = index_buffer;
+
+      /* u_threaded_context stores start/count in min/max_index for single draws. */
+      draw->info.min_index = (uintptr_t)indices >> index_size_shift;
+      draw->info.max_index = count;
+      draw->index_bias = basevertex;
+      return;
+   }
+
+   struct pipe_draw_info info;
+   struct pipe_draw_start_count_bias draw;
 
    info.mode = mode;
    info.index_size = 1 << index_size_shift;
@@ -1661,7 +1689,7 @@ _mesa_validated_drawrangeelements(struct gl_context *ctx,
    } else {
       draw.start = (uintptr_t)indices >> index_size_shift;
 
-      if (ctx->st->pipe->draw_vbo == tc_draw_vbo) {
+      if (ctx->pipe->draw_vbo == tc_draw_vbo) {
          /* Fast path for u_threaded_context to eliminate atomics. */
          info.index.resource = _mesa_get_bufferobj_reference(ctx, index_bo);
          info.take_index_buffer_ownership = true;
@@ -1675,11 +1703,10 @@ _mesa_validated_drawrangeelements(struct gl_context *ctx,
    info.max_index = end;
    draw.count = count;
 
-   st_prepare_draw(ctx, ST_PIPELINE_RENDER_STATE_MASK);
    if (!validate_index_bounds(ctx, &info, &draw, 1))
       return;
 
-   ctx->Driver.DrawGallium(ctx, &info, ctx->DrawID, &draw, 1);
+   ctx->Driver.DrawGallium(ctx, &info, ctx->DrawID, NULL, &draw, 1);
 
    if (MESA_DEBUG_FLAGS & DEBUG_ALWAYS_FLUSH) {
       _mesa_flush(ctx);
@@ -1923,7 +1950,7 @@ _mesa_DrawElementsUserBuf(const GLvoid *ptr)
       (const struct marshal_cmd_DrawElementsUserBuf *)ptr;
    const GLenum mode = cmd->mode;
    const GLsizei count = cmd->count;
-   const GLenum type = cmd->type;
+   const GLenum type = _mesa_decode_index_type(cmd->type);
    const GLsizei instance_count = cmd->instance_count;
 
    if (!_mesa_is_no_error_enabled(ctx) &&
@@ -1946,6 +1973,40 @@ _mesa_DrawElementsUserBuf(const GLvoid *ptr)
    ctx->DrawID = 0;
 }
 
+/**
+ * Same as glDrawElementsInstancedBaseVertexBaseInstance, but the index
+ * buffer is set by the indexBuf parameter instead of using the bound
+ * GL_ELEMENT_ARRAY_BUFFER if indexBuf != NULL.
+ */
+void GLAPIENTRY
+_mesa_DrawElementsUserBufPacked(const GLvoid *ptr)
+{
+   GET_CURRENT_CONTEXT(ctx);
+   FLUSH_FOR_DRAW(ctx);
+
+   _mesa_set_varying_vp_inputs(ctx, ctx->VertexProgram._VPModeInputFilter &
+                               ctx->Array._DrawVAO->_EnabledWithMapMode);
+   if (ctx->NewState)
+      _mesa_update_state(ctx);
+
+   const struct marshal_cmd_DrawElementsUserBufPacked *cmd =
+      (const struct marshal_cmd_DrawElementsUserBufPacked *)ptr;
+   const GLenum mode = cmd->mode;
+   const GLsizei count = cmd->count;
+   const GLenum type = _mesa_decode_index_type(cmd->type);
+
+   if (!_mesa_is_no_error_enabled(ctx) &&
+       !_mesa_validate_DrawElements(ctx, mode, count, type))
+      return;
+
+   struct gl_buffer_object *index_bo =
+      cmd->index_buffer ? cmd->index_buffer : ctx->Array.VAO->IndexBufferObj;
+
+   const GLvoid *indices = (void*)(uintptr_t)cmd->indices;
+
+   _mesa_validated_drawrangeelements(ctx, index_bo, mode, false, 0, ~0,
+                                     count, type, indices, 0, 1, 0);
+}
 
 /**
  * Inner support for both _mesa_MultiDrawElements() and
@@ -1966,7 +2027,7 @@ _mesa_validated_multidrawelements(struct gl_context *ctx,
    if (primcount == 0)
       return;
 
-   unsigned index_size_shift = get_index_size_shift(type);
+   unsigned index_size_shift = _mesa_get_index_size_shift(type);
 
    min_index_ptr = (uintptr_t) indices[0];
    max_index_ptr = 0;
@@ -2016,7 +2077,7 @@ _mesa_validated_multidrawelements(struct gl_context *ctx,
    if (info.has_user_indices) {
       info.index.user = (void*)min_index_ptr;
    } else {
-      if (ctx->st->pipe->draw_vbo == tc_draw_vbo) {
+      if (ctx->pipe->draw_vbo == tc_draw_vbo) {
          /* Fast path for u_threaded_context to eliminate atomics. */
          info.index.resource = _mesa_get_bufferobj_reference(ctx, index_bo);
          info.take_index_buffer_ownership = true;
@@ -2063,11 +2124,13 @@ _mesa_validated_multidrawelements(struct gl_context *ctx,
       if (!validate_index_bounds(ctx, &info, draw, primcount))
          return;
 
-      ctx->Driver.DrawGallium(ctx, &info, 0, draw, primcount);
+      ctx->Driver.DrawGallium(ctx, &info, 0, NULL, draw, primcount);
    } else {
       /* draw[i].start would overflow. Draw one at a time. */
       assert(info.has_user_indices);
       info.increment_draw_id = false;
+
+      st_prepare_draw(ctx, ST_PIPELINE_RENDER_STATE_MASK);
 
       for (int i = 0; i < primcount; i++) {
          struct pipe_draw_start_count_bias draw;
@@ -2082,11 +2145,10 @@ _mesa_validated_multidrawelements(struct gl_context *ctx,
          draw.index_bias = basevertex ? basevertex[i] : 0;
          draw.count = count[i];
 
-         st_prepare_draw(ctx, ST_PIPELINE_RENDER_STATE_MASK);
-         if (!validate_index_bounds(ctx, &info, &draw, 1))
+         if (!draw.count || !validate_index_bounds(ctx, &info, &draw, 1))
             continue;
 
-         ctx->Driver.DrawGallium(ctx, &info, i, &draw, 1);
+         ctx->Driver.DrawGallium(ctx, &info, i, NULL, &draw, 1);
       }
    }
 
@@ -2246,7 +2308,7 @@ _mesa_DrawTransformFeedbackStreamInstanced(GLenum mode, GLuint name,
    info.mode = mode;
    info.instance_count = primcount;
 
-   cso_draw_vbo(st_context(ctx)->cso_context, &info, 0, &indirect, &draw, 1);
+   ctx->Driver.DrawGallium(ctx, &info, 0, &indirect, &draw, 1);
 
    if (MESA_DEBUG_FLAGS & DEBUG_ALWAYS_FLUSH) {
       _mesa_flush(ctx);
@@ -2399,6 +2461,8 @@ _mesa_MultiDrawArraysIndirect(GLenum mode, const GLvoid *indirect,
       info.index_bias_varies = false;
       /* Packed section end. */
 
+      st_prepare_draw(ctx, ST_PIPELINE_RENDER_STATE_MASK);
+
       const uint8_t *ptr = (const uint8_t *) indirect;
       for (unsigned i = 0; i < primcount; i++) {
          DrawArraysIndirectCommand *cmd = (DrawArraysIndirectCommand *) ptr;
@@ -2410,9 +2474,10 @@ _mesa_MultiDrawArraysIndirect(GLenum mode, const GLvoid *indirect,
          draw.start = cmd->first;
          draw.count = cmd->count;
 
-         st_prepare_draw(ctx, ST_PIPELINE_RENDER_STATE_MASK);
+         if (!draw.count)
+            continue;
 
-         ctx->Driver.DrawGallium(ctx, &info, i, &draw, 1);
+         ctx->Driver.DrawGallium(ctx, &info, i, NULL, &draw, 1);
          ptr += stride;
       }
 
@@ -2475,7 +2540,7 @@ _mesa_MultiDrawElementsIndirect(GLenum mode, GLenum type,
            !_mesa_validate_DrawElements(ctx, mode, 1, type)))
          return;
 
-      unsigned index_size_shift = get_index_size_shift(type);
+      unsigned index_size_shift = _mesa_get_index_size_shift(type);
 
       struct pipe_draw_info info;
       info.mode = mode;
@@ -2494,7 +2559,7 @@ _mesa_MultiDrawElementsIndirect(GLenum mode, GLenum type,
 
       struct gl_buffer_object *index_bo = ctx->Array.VAO->IndexBufferObj;
 
-      if (ctx->st->pipe->draw_vbo == tc_draw_vbo) {
+      if (ctx->pipe->draw_vbo == tc_draw_vbo) {
          /* Fast path for u_threaded_context to eliminate atomics. */
          info.index.resource = _mesa_get_bufferobj_reference(ctx, index_bo);
          info.take_index_buffer_ownership = true;
@@ -2511,6 +2576,8 @@ _mesa_MultiDrawElementsIndirect(GLenum mode, GLenum type,
       if (!info.index.resource)
          return;
 
+      st_prepare_draw(ctx, ST_PIPELINE_RENDER_STATE_MASK);
+
       const uint8_t *ptr = (const uint8_t *) indirect;
       for (unsigned i = 0; i < primcount; i++) {
          DrawElementsIndirectCommand *cmd = (DrawElementsIndirectCommand*)ptr;
@@ -2523,11 +2590,10 @@ _mesa_MultiDrawElementsIndirect(GLenum mode, GLenum type,
          draw.count = cmd->count;
          draw.index_bias = cmd->baseVertex;
 
-         st_prepare_draw(ctx, ST_PIPELINE_RENDER_STATE_MASK);
-         if (!validate_index_bounds(ctx, &info, &draw, 1))
+         if (!draw.count || !validate_index_bounds(ctx, &info, &draw, 1))
             continue;
 
-         ctx->Driver.DrawGallium(ctx, &info, i, &draw, 1);
+         ctx->Driver.DrawGallium(ctx, &info, i, NULL, &draw, 1);
          ptr += stride;
       }
 

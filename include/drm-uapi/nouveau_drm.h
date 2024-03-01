@@ -45,14 +45,28 @@ extern "C" {
 #define NOUVEAU_GETPARAM_HAS_BO_USAGE    15
 #define NOUVEAU_GETPARAM_HAS_PAGEFLIP    16
 
-/**
- * @NOUVEAU_GETPARAM_EXEC_PUSH_MAX
+/*
+ * NOUVEAU_GETPARAM_EXEC_PUSH_MAX - query max pushes through getparam
  *
  * Query the maximum amount of IBs that can be pushed through a single
  * &drm_nouveau_exec structure and hence a single &DRM_IOCTL_NOUVEAU_EXEC
  * ioctl().
  */
 #define NOUVEAU_GETPARAM_EXEC_PUSH_MAX   17
+
+/*
+ * NOUVEAU_GETPARAM_VRAM_BAR_SIZE - query bar size
+ *
+ * Query the VRAM BAR size.
+ */
+#define NOUVEAU_GETPARAM_VRAM_BAR_SIZE 18
+
+/*
+ * NOUVEAU_GETPARAM_VRAM_USED
+ *
+ * Get remaining VRAM size.
+ */
+#define NOUVEAU_GETPARAM_VRAM_USED 19
 
 struct drm_nouveau_getparam {
 	__u64 param;

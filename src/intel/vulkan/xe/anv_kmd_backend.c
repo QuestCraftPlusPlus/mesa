@@ -111,12 +111,23 @@ xe_gem_mmap(struct anv_device *device, struct anv_bo *bo, uint64_t offset,
                device->fd, args.offset);
 }
 
+static inline uint32_t
+capture_vm_in_error_dump(struct anv_device *device, struct anv_bo *bo)
+{
+   enum anv_bo_alloc_flags alloc_flags = bo ? bo->alloc_flags : 0;
+   bool capture = INTEL_DEBUG(DEBUG_CAPTURE_ALL) ||
+                  (alloc_flags & ANV_BO_ALLOC_CAPTURE);
+
+   return capture ? DRM_XE_VM_BIND_FLAG_DUMPABLE : 0;
+}
+
 static inline int
 xe_vm_bind_op(struct anv_device *device,
               struct anv_sparse_submission *submit)
 {
    struct drm_xe_sync xe_sync = {
-      .type = DRM_XE_SYNC_TYPE_SYNCOBJ,
+      .handle = intel_bind_timeline_get_syncobj(&device->bind_timeline),
+      .type = DRM_XE_SYNC_TYPE_TIMELINE_SYNCOBJ,
       .flags = DRM_XE_SYNC_FLAG_SIGNAL,
    };
    struct drm_xe_vm_bind args = {
@@ -125,12 +136,6 @@ xe_vm_bind_op(struct anv_device *device,
       .bind = {},
       .num_syncs = 1,
       .syncs = (uintptr_t)&xe_sync,
-   };
-   struct drm_syncobj_create syncobj_create = {};
-   struct drm_syncobj_destroy syncobj_destroy = {};
-   struct drm_syncobj_wait syncobj_wait = {
-      .timeout_nsec = INT64_MAX,
-      .count_handles = 1,
    };
    int ret;
 
@@ -158,7 +163,7 @@ xe_vm_bind_op(struct anv_device *device,
          .range = bind->size,
          .addr = intel_48b_address(bind->address),
          .op = DRM_XE_VM_BIND_OP_UNMAP,
-         .flags = 0,
+         .flags = capture_vm_in_error_dump(device, bo),
          .prefetch_mem_region_instance = 0,
       };
 
@@ -176,6 +181,13 @@ xe_vm_bind_op(struct anv_device *device,
             xe_bind->op = DRM_XE_VM_BIND_OP_MAP;
             xe_bind->obj = bo->gem_handle;
          }
+      } else if (bind->op == ANV_VM_UNBIND_ALL) {
+         xe_bind->op = DRM_XE_VM_BIND_OP_UNMAP_ALL;
+         xe_bind->obj = bo->gem_handle;
+         assert(bind->address == 0);
+         assert(bind->size == 0);
+      } else {
+         assert(bind->op == ANV_VM_UNBIND);
       }
 
       /* userptr and bo_offset are an union! */
@@ -183,21 +195,15 @@ xe_vm_bind_op(struct anv_device *device,
          xe_bind->userptr = (uintptr_t)bo->map;
    }
 
-   ret = intel_ioctl(device->fd, DRM_IOCTL_SYNCOBJ_CREATE, &syncobj_create);
+   xe_sync.timeline_value = intel_bind_timeline_bind_begin(&device->bind_timeline);
+   ret = intel_ioctl(device->fd, DRM_IOCTL_XE_VM_BIND, &args);
+   intel_bind_timeline_bind_end(&device->bind_timeline);
+
    if (ret)
       goto out_stackarray;
 
-   xe_sync.handle = syncobj_create.handle;
-   ret = intel_ioctl(device->fd, DRM_IOCTL_XE_VM_BIND, &args);
-   if (ret)
-      goto out_destroy_syncobj;
+   ANV_RMV(vm_binds, device, submit->binds, submit->binds_len);
 
-   syncobj_wait.handles = (uintptr_t)&xe_sync.handle;
-   ret = intel_ioctl(device->fd, DRM_IOCTL_SYNCOBJ_WAIT, &syncobj_wait);
-
-out_destroy_syncobj:
-   syncobj_destroy.handle = xe_sync.handle;
-   intel_ioctl(device->fd, DRM_IOCTL_SYNCOBJ_DESTROY, &syncobj_destroy);
 out_stackarray:
    STACK_ARRAY_FINISH(xe_binds_stackarray);
 
@@ -234,10 +240,10 @@ static int xe_vm_unbind_bo(struct anv_device *device, struct anv_bo *bo)
 {
    struct anv_vm_bind bind = {
       .bo = bo,
-      .address = bo->offset,
+      .address = 0,
       .bo_offset = 0,
-      .size = bo->actual_size,
-      .op = ANV_VM_UNBIND,
+      .size = 0,
+      .op = ANV_VM_UNBIND_ALL,
    };
    struct anv_sparse_submission submit = {
       .queue = NULL,

@@ -42,6 +42,10 @@ d3d12_video_encoder_update_current_rate_control_h264(struct d3d12_video_encoder 
       picture->rate_ctrl[0].frame_rate_den;
    pD3D12Enc->m_currentEncodeConfig.m_encoderRateControlDesc.m_Flags = D3D12_VIDEO_ENCODER_RATE_CONTROL_FLAG_NONE;
 
+   if (picture->roi.num > 0)
+      pD3D12Enc->m_currentEncodeConfig.m_encoderRateControlDesc.m_Flags |=
+         D3D12_VIDEO_ENCODER_RATE_CONTROL_FLAG_ENABLE_DELTA_QP;
+
    switch (picture->rate_ctrl[0].rate_ctrl_method) {
       case PIPE_H2645_ENC_RATE_CONTROL_METHOD_VARIABLE_SKIP:
       case PIPE_H2645_ENC_RATE_CONTROL_METHOD_VARIABLE:
@@ -345,6 +349,21 @@ d3d12_video_encoder_update_current_frame_pic_params_info_h264(struct d3d12_video
       picParams.pH264PicData->List1ReferenceFramesCount = h264Pic->num_ref_idx_l1_active_minus1 + 1;
       picParams.pH264PicData->pList1ReferenceFrames = h264Pic->ref_idx_l1_list;
    }
+
+   if ((pD3D12Enc->m_currentEncodeConfig.m_encoderRateControlDesc.m_Flags & D3D12_VIDEO_ENCODER_RATE_CONTROL_FLAG_ENABLE_DELTA_QP) != 0)
+   {
+      // Use 8 bit qpmap array for H264 picparams (-51, 51 range and int8_t pRateControlQPMap type)
+      const int32_t h264_min_delta_qp = -51;
+      const int32_t h264_max_delta_qp = 51;
+      d3d12_video_encoder_update_picparams_region_of_interest_qpmap(
+         pD3D12Enc,
+         &h264Pic->roi,
+         h264_min_delta_qp,
+         h264_max_delta_qp,
+         pD3D12Enc->m_currentEncodeConfig.m_encoderRateControlDesc.m_pRateControlQPMap8Bit);
+      picParams.pH264PicData->pRateControlQPMap = pD3D12Enc->m_currentEncodeConfig.m_encoderRateControlDesc.m_pRateControlQPMap8Bit.data();
+      picParams.pH264PicData->QPMapValuesCount = pD3D12Enc->m_currentEncodeConfig.m_encoderRateControlDesc.m_pRateControlQPMap8Bit.size();
+   }
 }
 
 D3D12_VIDEO_ENCODER_FRAME_TYPE_H264
@@ -406,48 +425,73 @@ d3d12_video_encoder_negotiate_current_h264_slices_configuration(struct d3d12_vid
          pD3D12Enc->m_currentEncodeConfig.m_currentResolution.Width / D3D12_VIDEO_H264_MB_IN_PIXELS;
       bool bSliceAligned = ((picture->slices_descriptors[0].num_macroblocks % mbPerScanline) == 0);
 
-      if (bUniformSizeSlices && bSliceAligned &&
-                 d3d12_video_encoder_check_subregion_mode_support(
-                    pD3D12Enc,
-                    D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_UNIFORM_PARTITIONING_ROWS_PER_SUBREGION)) {
+      if (bUniformSizeSlices) {
+         if (picture->intra_refresh.mode != INTRA_REFRESH_MODE_NONE) {
+            /*
+            * When intra-refresh is active, we must use D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_UNIFORM_PARTITIONING_SUBREGIONS_PER_FRAME
+            */
+            if (d3d12_video_encoder_check_subregion_mode_support(
+                     pD3D12Enc,
+                     D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_UNIFORM_PARTITIONING_SUBREGIONS_PER_FRAME)) {
+               requestedSlicesMode =
+                  D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_UNIFORM_PARTITIONING_SUBREGIONS_PER_FRAME;
+               requestedSlicesConfig.NumberOfSlicesPerFrame = picture->num_slice_descriptors;
+               debug_printf("[d3d12_video_encoder_h264] Intra-refresh is active and per DX12 spec it requires using multi slice encoding mode: "
+                              "D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_UNIFORM_PARTITIONING_SUBREGIONS_PER_FRAME "
+                              "with %d slices per frame.\n",
+                              requestedSlicesConfig.NumberOfSlicesPerFrame);
+            } else {
+               debug_printf("[d3d12_video_encoder_h264] Intra-refresh is active which requires "
+                              "D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_UNIFORM_PARTITIONING_SUBREGIONS_PER_FRAME "
+                              "mode but there is HW support for such mode.\n");
+               return false;
+            }
+         } else if (bSliceAligned &&
+                  d3d12_video_encoder_check_subregion_mode_support(
+                     pD3D12Enc,
+                     D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_UNIFORM_PARTITIONING_ROWS_PER_SUBREGION)) {
 
-         // Number of macroblocks per slice is aligned to a scanline width, in which case we can
-         // use D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_UNIFORM_PARTITIONING_ROWS_PER_SUBREGION
-         requestedSlicesMode = D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_UNIFORM_PARTITIONING_ROWS_PER_SUBREGION;
-         requestedSlicesConfig.NumberOfRowsPerSlice = (picture->slices_descriptors[0].num_macroblocks / mbPerScanline);
-         debug_printf("[d3d12_video_encoder_h264] Using multi slice encoding mode: "
-                        "D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_UNIFORM_PARTITIONING_ROWS_PER_SUBREGION with "
-                        "%d macroblocks rows per slice.\n",
-                        requestedSlicesConfig.NumberOfRowsPerSlice);
-      } else if (bUniformSizeSlices &&
-                 d3d12_video_encoder_check_subregion_mode_support(
-                    pD3D12Enc,
-                    D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_UNIFORM_PARTITIONING_SUBREGIONS_PER_FRAME)) {
-            requestedSlicesMode =
-               D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_UNIFORM_PARTITIONING_SUBREGIONS_PER_FRAME;
-            requestedSlicesConfig.NumberOfSlicesPerFrame = picture->num_slice_descriptors;
+            // Number of macroblocks per slice is aligned to a scanline width, in which case we can
+            // use D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_UNIFORM_PARTITIONING_ROWS_PER_SUBREGION
+            requestedSlicesMode = D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_UNIFORM_PARTITIONING_ROWS_PER_SUBREGION;
+            requestedSlicesConfig.NumberOfRowsPerSlice = (picture->slices_descriptors[0].num_macroblocks / mbPerScanline);
             debug_printf("[d3d12_video_encoder_h264] Using multi slice encoding mode: "
-                           "D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_UNIFORM_PARTITIONING_SUBREGIONS_PER_FRAME "
-                           "with %d slices per frame.\n",
-                           requestedSlicesConfig.NumberOfSlicesPerFrame);
-      } else if (bUniformSizeSlices &&
-                 d3d12_video_encoder_check_subregion_mode_support(
-                    pD3D12Enc,
-                    D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_SQUARE_UNITS_PER_SUBREGION_ROW_UNALIGNED)) {
-            requestedSlicesMode =
-               D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_SQUARE_UNITS_PER_SUBREGION_ROW_UNALIGNED;
-            requestedSlicesConfig.NumberOfCodingUnitsPerSlice = picture->slices_descriptors[0].num_macroblocks;
-            debug_printf("[d3d12_video_encoder_h264] Using multi slice encoding mode: "
-                           "D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_SQUARE_UNITS_PER_SUBREGION_ROW_UNALIGNED "
-                           "with %d NumberOfCodingUnitsPerSlice per frame.\n",
-                           requestedSlicesConfig.NumberOfCodingUnitsPerSlice);
-
+                           "D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_UNIFORM_PARTITIONING_ROWS_PER_SUBREGION with "
+                           "%d macroblocks rows per slice.\n",
+                           requestedSlicesConfig.NumberOfRowsPerSlice);
+         } else if (d3d12_video_encoder_check_subregion_mode_support(
+                     pD3D12Enc,
+                     D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_UNIFORM_PARTITIONING_SUBREGIONS_PER_FRAME)) {
+               requestedSlicesMode =
+                  D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_UNIFORM_PARTITIONING_SUBREGIONS_PER_FRAME;
+               requestedSlicesConfig.NumberOfSlicesPerFrame = picture->num_slice_descriptors;
+               debug_printf("[d3d12_video_encoder_h264] Using multi slice encoding mode: "
+                              "D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_UNIFORM_PARTITIONING_SUBREGIONS_PER_FRAME "
+                              "with %d slices per frame.\n",
+                              requestedSlicesConfig.NumberOfSlicesPerFrame);
+         } else if (d3d12_video_encoder_check_subregion_mode_support(
+                     pD3D12Enc,
+                     D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_SQUARE_UNITS_PER_SUBREGION_ROW_UNALIGNED)) {
+               requestedSlicesMode =
+                  D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_SQUARE_UNITS_PER_SUBREGION_ROW_UNALIGNED;
+               requestedSlicesConfig.NumberOfCodingUnitsPerSlice = picture->slices_descriptors[0].num_macroblocks;
+               debug_printf("[d3d12_video_encoder_h264] Using multi slice encoding mode: "
+                              "D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_SQUARE_UNITS_PER_SUBREGION_ROW_UNALIGNED "
+                              "with %d NumberOfCodingUnitsPerSlice per frame.\n",
+                              requestedSlicesConfig.NumberOfCodingUnitsPerSlice);
+         } else {
+            debug_printf("[d3d12_video_encoder_h264] Requested slice control mode is not supported by hardware: No HW support for "
+                           "D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_UNIFORM_PARTITIONING_ROWS_PER_SUBREGION or"
+                           "D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_UNIFORM_PARTITIONING_SUBREGIONS_PER_FRAME or"
+                           "D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_SQUARE_UNITS_PER_SUBREGION_ROW_UNALIGNED.\n");
+            return false;
+         }
       } else {
          debug_printf("[d3d12_video_encoder_h264] Requested slice control mode is not supported: All slices must "
                          "have the same number of macroblocks.\n");
          return false;
       }
-   } else if(picture->slice_mode == PIPE_VIDEO_SLICE_MODE_MAX_SLICE_SICE) {
+   } else if(picture->slice_mode == PIPE_VIDEO_SLICE_MODE_MAX_SLICE_SIZE) {
       if ((picture->max_slice_bytes > 0) &&
                  d3d12_video_encoder_check_subregion_mode_support(
                     pD3D12Enc,
@@ -460,8 +504,8 @@ d3d12_video_encoder_negotiate_current_h264_slices_configuration(struct d3d12_vid
                            "with %d MaxBytesPerSlice per frame.\n",
                            requestedSlicesConfig.MaxBytesPerSlice);
       } else {
-         debug_printf("[d3d12_video_encoder_h264] Requested slice control mode is not supported: All slices must "
-                         "have the same number of macroblocks.\n");
+         debug_printf("[d3d12_video_encoder_h264] Requested slice control mode is not supported: No HW support for "
+                         "D3D12_VIDEO_ENCODER_FRAME_SUBREGION_LAYOUT_MODE_BYTES_PER_SUBREGION.\n");
          return false;
       }
    } else {

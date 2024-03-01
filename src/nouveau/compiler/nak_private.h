@@ -18,6 +18,7 @@ bool nak_should_print_nir(void);
 
 struct nak_compiler {
    uint8_t sm;
+   uint8_t warps_per_sm;
 
    struct nir_shader_compiler_options nir_options;
 };
@@ -87,6 +88,8 @@ enum ENUM_PACKED nak_attr {
 
 enum ENUM_PACKED nak_sv {
    NAK_SV_LANE_ID          = 0x00,
+   NAK_SV_VIRTCFG          = 0x02,
+   NAK_SV_VIRTID           = 0x03,
    NAK_SV_VERTEX_COUNT     = 0x10,
    NAK_SV_INVOCATION_ID    = 0x11,
    NAK_SV_THREAD_KILL      = 0x13,
@@ -105,7 +108,9 @@ enum ENUM_PACKED nak_sv {
    NAK_SV_LANEMASK_LE      = 0x3a,
    NAK_SV_LANEMASK_GT      = 0x3b,
    NAK_SV_LANEMASK_GE      = 0x3c,
-   NAK_SV_CLOCK            = 0x50,
+   NAK_SV_CLOCK_LO         = 0x50,
+   NAK_SV_CLOCK_HI         = 0x51,
+   NAK_SV_CLOCK            = NAK_SV_CLOCK_LO,
 };
 
 bool nak_nir_workgroup_has_one_subgroup(const nir_shader *nir);
@@ -196,9 +201,36 @@ enum nak_fs_out {
    NAK_FS_OUT_DEPTH = 0x84,
 };
 
+#define NAK_FS_OUT_COLOR(n) (NAK_FS_OUT_COLOR0 + (n) * 16)
+
 bool nak_nir_add_barriers(nir_shader *nir, const struct nak_compiler *nak);
 
-#define NAK_FS_OUT_COLOR(n) (NAK_FS_OUT_COLOR0 + (n) * 16)
+static inline bool
+nak_is_only_used_by_iadd(const nir_alu_instr *instr)
+{
+   nir_foreach_use(src, &instr->def) {
+      nir_instr *use = nir_src_parent_instr(src);
+      if (use->type != nir_instr_type_alu)
+         return false;
+
+      if (nir_instr_as_alu(use)->op != nir_op_iadd)
+         return false;
+   }
+
+   return true;
+}
+
+struct nak_memstream {
+   FILE *stream;
+   char *buffer;
+   size_t written;
+};
+
+void nak_open_memstream(struct nak_memstream *memstream);
+void nak_close_memstream(struct nak_memstream *memstream);
+void nak_flush_memstream(struct nak_memstream *memstream);
+void nak_clear_memstream(struct nak_memstream *memstream);
+void nak_nir_asprint_instr(struct nak_memstream *memstream, const nir_instr *instr);
 
 #ifdef __cplusplus
 }

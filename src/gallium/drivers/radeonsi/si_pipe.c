@@ -27,7 +27,7 @@
 
 #include "aco_interface.h"
 
-#ifdef LLVM_AVAILABLE
+#if LLVM_AVAILABLE
 #include "ac_llvm_util.h"
 #endif
 
@@ -135,7 +135,7 @@ static const struct debug_named_value test_options[] = {
 
 struct ac_llvm_compiler *si_create_llvm_compiler(struct si_screen *sscreen)
 {
-#ifdef LLVM_AVAILABLE
+#if LLVM_AVAILABLE
    struct ac_llvm_compiler *compiler = CALLOC_STRUCT(ac_llvm_compiler);
    if (!compiler)
       return NULL;
@@ -179,7 +179,7 @@ void si_init_aux_async_compute_ctx(struct si_screen *sscreen)
 
 static void si_destroy_llvm_compiler(struct ac_llvm_compiler *compiler)
 {
-#ifdef LLVM_AVAILABLE
+#if LLVM_AVAILABLE
    ac_destroy_llvm_compiler(compiler);
    FREE(compiler);
 #endif
@@ -351,7 +351,7 @@ static void si_destroy_context(struct pipe_context *context)
 
    u_suballocator_destroy(&sctx->allocator_zeroed_memory);
 
-   sctx->ws->fence_reference(&sctx->last_gfx_fence, NULL);
+   sctx->ws->fence_reference(sctx->ws, &sctx->last_gfx_fence, NULL);
    si_resource_reference(&sctx->eop_bug_scratch, NULL);
    si_resource_reference(&sctx->eop_bug_scratch_tmz, NULL);
    si_resource_reference(&sctx->shadowing.registers, NULL);
@@ -470,7 +470,7 @@ static void si_set_context_param(struct pipe_context *ctx, enum pipe_context_par
    struct radeon_winsys *ws = ((struct si_context *)ctx)->ws;
 
    switch (param) {
-   case PIPE_CONTEXT_PARAM_PIN_THREADS_TO_L3_CACHE:
+   case PIPE_CONTEXT_PARAM_UPDATE_THREAD_SCHEDULING:
       ws->pin_threads_to_L3_cache(ws, value);
       break;
    default:;
@@ -787,16 +787,11 @@ static struct pipe_context *si_create_context(struct pipe_screen *screen, unsign
    if (sctx->gfx_level >= GFX9) {
       /* The LS output / HS input layout can be communicated
        * directly instead of via user SGPRs for merged LS-HS.
-       * This also enables jumping over the VS prolog for HS-only waves.
-       *
-       * When the LS VGPR fix is needed, monolithic shaders can:
-       *  - avoid initializing EXEC in both the LS prolog
-       *    and the LS main part when !vs_needs_prolog
-       *  - remove the fixup for unused input VGPRs
+       * This also enables jumping over the VS for HS-only waves.
        */
       sctx->shader.tcs.key.ge.opt.prefer_mono = 1;
 
-      /* This enables jumping over the VS prolog for GS-only waves. */
+      /* This enables jumping over the VS for GS-only waves. */
       sctx->shader.gs.key.ge.opt.prefer_mono = 1;
    }
 
@@ -962,8 +957,8 @@ static struct pipe_context *si_pipe_create_context(struct pipe_screen *screen, v
 static void si_destroy_screen(struct pipe_screen *pscreen)
 {
    struct si_screen *sscreen = (struct si_screen *)pscreen;
-   struct si_shader_part *parts[] = {sscreen->vs_prologs, sscreen->tcs_epilogs,
-                                     sscreen->ps_prologs, sscreen->ps_epilogs};
+   struct si_shader_part *parts[] = {sscreen->tcs_epilogs, sscreen->ps_prologs,
+                                     sscreen->ps_epilogs};
    unsigned i;
 
    if (!sscreen->ws->unref(sscreen->ws))
@@ -979,6 +974,9 @@ static void si_destroy_screen(struct pipe_screen *pscreen)
    }
 
    si_resource_reference(&sscreen->attribute_ring, NULL);
+
+   util_queue_destroy(&sscreen->shader_compiler_queue);
+   util_queue_destroy(&sscreen->shader_compiler_queue_opt_variants);
 
    for (unsigned i = 0; i < ARRAY_SIZE(sscreen->aux_contexts); i++) {
       if (!sscreen->aux_contexts[i].ctx)
@@ -1001,9 +999,6 @@ static void si_destroy_screen(struct pipe_screen *pscreen)
    if (sscreen->async_compute_context) {
       sscreen->async_compute_context->destroy(sscreen->async_compute_context);
    }
-
-   util_queue_destroy(&sscreen->shader_compiler_queue);
-   util_queue_destroy(&sscreen->shader_compiler_queue_opt_variants);
 
    /* Release the reference on glsl types of the compiler threads. */
    glsl_type_singleton_decref();
@@ -1087,7 +1082,7 @@ static void si_test_gds_memory_management(struct si_context *sctx, unsigned allo
 {
    struct radeon_winsys *ws = sctx->ws;
    struct radeon_cmdbuf cs[8];
-   struct pb_buffer *gds_bo[ARRAY_SIZE(cs)];
+   struct pb_buffer_lean *gds_bo[ARRAY_SIZE(cs)];
 
    for (unsigned i = 0; i < ARRAY_SIZE(cs); i++) {
       ws->cs_create(&cs[i], sctx->ctx, AMD_IP_COMPUTE, NULL, NULL);
@@ -1133,7 +1128,7 @@ static void si_disk_cache_create(struct si_screen *sscreen)
     * the LLVM function identifier. ACO is a built-in component in mesa, so no need
     * to add aco function here.
     */
-#ifdef LLVM_AVAILABLE
+#if LLVM_AVAILABLE
    if (!sscreen->use_aco &&
        !disk_cache_get_function_identifier(LLVMInitializeAMDGPUTargetInfo, &ctx))
       return;
@@ -1207,7 +1202,7 @@ static struct pipe_screen *radeonsi_screen_create_impl(struct radeon_winsys *ws,
    if (sscreen->debug_flags & DBG(SHADOW_REGS))
       sscreen->info.register_shadowing_required = true;
 
-#ifdef LLVM_AVAILABLE
+#if LLVM_AVAILABLE
    sscreen->use_aco = (sscreen->debug_flags & DBG(USE_ACO));
 #else
    sscreen->use_aco = true;
@@ -1555,7 +1550,7 @@ struct pipe_screen *radeonsi_screen_create(int fd, const struct pipe_screen_conf
    if (!version)
      return NULL;
 
-#ifdef LLVM_AVAILABLE
+#if LLVM_AVAILABLE
    /* LLVM must be initialized before util_queue because both u_queue and LLVM call atexit,
     * and LLVM must call it first because its atexit handler executes C++ destructors,
     * which must be done after our compiler threads using LLVM in u_queue are finished

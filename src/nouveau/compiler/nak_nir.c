@@ -116,10 +116,10 @@ optimize_nir(nir_shader *nir, const struct nak_compiler *nak, bool allow_copies)
       }
 
       OPT(nir, nir_opt_dead_cf);
-      if (OPT(nir, nir_opt_trivial_continues)) {
-         /* If nir_opt_trivial_continues makes progress, then we need to clean
-          * things up if we want any hope of nir_opt_if or nir_opt_loop_unroll
-          * to make progress.
+      if (OPT(nir, nir_opt_loop)) {
+         /* If nir_opt_loop makes progress, then we need to clean things up
+          * if we want any hope of nir_opt_if or nir_opt_loop_unroll to make
+          * progress.
           */
          OPT(nir, nir_copy_prop);
          OPT(nir, nir_opt_dce);
@@ -400,7 +400,6 @@ nak_sysval_sysval_idx(gl_system_value sysval)
    case SYSTEM_VALUE_VERTICES_IN:            return NAK_SV_VERTEX_COUNT;
    case SYSTEM_VALUE_INVOCATION_ID:          return NAK_SV_INVOCATION_ID;
    case SYSTEM_VALUE_HELPER_INVOCATION:      return NAK_SV_THREAD_KILL;
-   case SYSTEM_VALUE_LOCAL_INVOCATION_INDEX: return NAK_SV_COMBINED_TID;
    case SYSTEM_VALUE_LOCAL_INVOCATION_ID:    return NAK_SV_TID;
    case SYSTEM_VALUE_WORKGROUP_ID:           return NAK_SV_CTAID;
    case SYSTEM_VALUE_SUBGROUP_EQ_MASK:       return NAK_SV_LANEMASK_EQ;
@@ -416,6 +415,8 @@ static bool
 nak_nir_lower_system_value_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
                                   void *data)
 {
+   const struct nak_compiler *nak = data;
+
    b->cursor = nir_before_instr(&intrin->instr);
 
    nir_def *val;
@@ -482,7 +483,6 @@ nak_nir_lower_system_value_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
    case nir_intrinsic_load_subgroup_invocation:
    case nir_intrinsic_load_helper_invocation:
    case nir_intrinsic_load_invocation_id:
-   case nir_intrinsic_load_local_invocation_index:
    case nir_intrinsic_load_local_invocation_id:
    case nir_intrinsic_load_workgroup_id:
    case nir_intrinsic_load_workgroup_id_zero_base: {
@@ -507,9 +507,78 @@ nak_nir_lower_system_value_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
       break;
    }
 
-   case nir_intrinsic_shader_clock:
-      val = nir_load_sysval_nv(b, 64, .base = NAK_SV_CLOCK);
-      val = nir_unpack_64_2x32(b, val);
+   case nir_intrinsic_shader_clock: {
+      /* The CS2R opcode can load 64 bits worth of sysval data at a time but
+       * it's not actually atomic.  In order to get correct shader clocks, we
+       * need to do a loop where we do
+       *
+       *    CS2R SV_CLOCK_HI
+       *    CS2R SV_CLOCK_LO
+       *    CS2R SV_CLOCK_HI
+       *    CS2R SV_CLOCK_LO
+       *    CS2R SV_CLOCK_HI
+       *    ...
+       *
+       * The moment two high values are the same, we take the low value
+       * between them and that gives us our clock.
+       *
+       * In order to make sure we don't run into any weird races, we also need
+       * to insert a barrier after every load to ensure the one load completes
+       * before we kick off the next load.  Otherwise, if one load happens to
+       * be faster than the other (they are variable latency, after all) we're
+       * still guaranteed that the loads happen in the order we want.
+       */
+      nir_variable *clock =
+         nir_local_variable_create(b->impl, glsl_uvec2_type(), NULL);
+
+      nir_def *clock_hi = nir_load_sysval_nv(b, 32, .base = NAK_SV_CLOCK_HI);
+      nir_ssa_bar_nv(b, clock_hi);
+
+      nir_store_var(b, clock, nir_vec2(b, nir_imm_int(b, 0), clock_hi), 0x3);
+
+      nir_push_loop(b);
+      {
+         nir_def *last_clock = nir_load_var(b, clock);
+
+         nir_def *clock_lo = nir_load_sysval_nv(b, 32, .base = NAK_SV_CLOCK_LO);
+         nir_ssa_bar_nv(b, clock_lo);
+
+         clock_hi = nir_load_sysval_nv(b, 32, .base = NAK_SV_CLOCK + 1);
+         nir_ssa_bar_nv(b, clock_hi);
+
+         nir_store_var(b, clock, nir_vec2(b, clock_lo, clock_hi), 0x3);
+
+         nir_push_if(b, nir_ieq(b, clock_hi, nir_channel(b, last_clock, 1)));
+         {
+            nir_jump(b, nir_jump_break);
+         }
+         nir_pop_if(b, NULL);
+      }
+      nir_pop_loop(b, NULL);
+
+      val = nir_load_var(b, clock);
+      if (intrin->def.bit_size == 64)
+         val = nir_pack_64_2x32(b, val);
+      break;
+   }
+
+   case nir_intrinsic_load_warps_per_sm_nv:
+      val = nir_imm_int(b, nak->warps_per_sm);
+      break;
+
+   case nir_intrinsic_load_sm_count_nv:
+      val = nir_load_sysval_nv(b, 32, .base = NAK_SV_VIRTCFG);
+      val = nir_ubitfield_extract_imm(b, val, 20, 9);
+      break;
+
+   case nir_intrinsic_load_warp_id_nv:
+      val = nir_load_sysval_nv(b, 32, .base = NAK_SV_VIRTID);
+      val = nir_ubitfield_extract_imm(b, val, 8, 7);
+      break;
+
+   case nir_intrinsic_load_sm_id_nv:
+      val = nir_load_sysval_nv(b, 32, .base = NAK_SV_VIRTID);
+      val = nir_ubitfield_extract_imm(b, val, 20, 9);
       break;
 
    default:
@@ -525,12 +594,11 @@ nak_nir_lower_system_value_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
 }
 
 static bool
-nak_nir_lower_system_values(nir_shader *nir)
+nak_nir_lower_system_values(nir_shader *nir, const struct nak_compiler *nak)
 {
    return nir_shader_intrinsics_pass(nir, nak_nir_lower_system_value_intrin,
-                                     nir_metadata_block_index |
-                                     nir_metadata_dominance,
-                                     NULL);
+                                     nir_metadata_none,
+                                     (void *)nak);
 }
 
 static bool
@@ -543,7 +611,8 @@ nak_nir_lower_varyings(nir_shader *nir, nir_variable_mode modes)
    nir_foreach_variable_with_modes(var, nir, modes)
       var->data.driver_location = nak_varying_attr_addr(var->data.location);
 
-   OPT(nir, nir_lower_io, modes, type_size_vec4_bytes, 0);
+   OPT(nir, nir_lower_io, modes, type_size_vec4_bytes,
+       nir_lower_io_lower_64bit_to_32);
 
    return progress;
 }
@@ -974,7 +1043,6 @@ nak_nir_lower_fs_outputs(nir_shader *nir)
 
    nir->num_outputs = 0;
    nir_foreach_shader_out_variable(var, nir) {
-      assert(nir->info.outputs_written & BITFIELD_BIT(var->data.location));
       switch (var->data.location) {
       case FRAG_RESULT_DEPTH:
          assert(var->data.index == 0);
@@ -985,8 +1053,7 @@ nak_nir_lower_fs_outputs(nir_shader *nir)
          unreachable("EXT_shader_stencil_export not supported");
          break;
       case FRAG_RESULT_COLOR:
-         assert(var->data.index == 0);
-         var->data.driver_location = NAK_FS_OUT_COLOR0;
+         unreachable("Vulkan alway uses explicit locations");
          break;
       case FRAG_RESULT_SAMPLE_MASK:
          assert(var->data.index == 0);
@@ -1165,7 +1232,7 @@ nak_postprocess_nir(nir_shader *nir,
           nir->info.tess._primitive_mode == TESS_PRIMITIVE_TRIANGLES);
    }
 
-   OPT(nir, nak_nir_lower_system_values);
+   OPT(nir, nak_nir_lower_system_values, nak);
 
    switch (nir->info.stage) {
    case MESA_SHADER_VERTEX:
@@ -1202,6 +1269,7 @@ nak_postprocess_nir(nir_shader *nir,
       unreachable("Unsupported shader stage");
    }
 
+   OPT(nir, nir_lower_doubles, NULL, nak->nir_options.lower_doubles_options);
    OPT(nir, nir_lower_int64);
 
    nak_optimize_nir(nir, nak);
@@ -1210,6 +1278,14 @@ nak_postprocess_nir(nir_shader *nir,
       progress = false;
       OPT(nir, nir_opt_algebraic_late);
       OPT(nir, nak_nir_lower_algebraic_late, nak);
+
+      /* If we're lowering fp64 sat but not min/max, the sat lowering may have
+       * been undone by nir_opt_algebraic.  Lower sat again just to be sure.
+       */
+      if ((nak->nir_options.lower_doubles_options & nir_lower_dsat) &&
+          !(nak->nir_options.lower_doubles_options & nir_lower_dminmax))
+         OPT(nir, nir_lower_doubles, NULL, nir_lower_dsat);
+
       if (progress) {
          OPT(nir, nir_opt_constant_folding);
          OPT(nir, nir_copy_prop);

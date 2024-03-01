@@ -93,8 +93,9 @@ set_feedback_vertex_format(struct gl_context *ctx)
  */
 void
 st_feedback_draw_vbo(struct gl_context *ctx,
-                     struct pipe_draw_info *info,
+                     const struct pipe_draw_info *info,
                      unsigned drawid_offset,
+                     const struct pipe_draw_indirect_info *indirect,
                      const struct pipe_draw_start_count_bias *draws,
                      unsigned num_draws)
 {
@@ -156,8 +157,8 @@ st_feedback_draw_vbo(struct gl_context *ctx,
       }
    }
 
-   draw_set_vertex_buffers(draw, num_vbuffers, 0, vbuffers);
    draw_set_vertex_elements(draw, vp->num_inputs, velements.velems);
+   draw_set_vertex_buffers(draw, num_vbuffers, vbuffers);
 
    if (info->index_size) {
       if (info->has_user_indices) {
@@ -386,8 +387,7 @@ st_feedback_draw_vbo(struct gl_context *ctx,
 
    /* draw here */
    for (i = 0; i < num_draws; i++) {
-      /* TODO: indirect draws */
-      draw_vbo(draw, info, info->increment_draw_id ? i : 0, NULL,
+      draw_vbo(draw, info, info->increment_draw_id ? i : 0, indirect,
                &draws[i], 1, ctx->TessCtrlProgram.patch_vertices);
    }
 
@@ -455,7 +455,7 @@ st_feedback_draw_vbo(struct gl_context *ctx,
       if (!vbuffers[buf].is_user_buffer)
          pipe_resource_reference(&vbuffers[buf].buffer.resource, NULL);
    }
-   draw_set_vertex_buffers(draw, 0, num_vbuffers, NULL);
+   draw_set_vertex_buffers(draw, 0, NULL);
 
    draw_bind_vertex_shader(draw, NULL);
 }
@@ -469,6 +469,6 @@ st_feedback_draw_vbo_multi_mode(struct gl_context *ctx,
 {
    for (unsigned i = 0; i < num_draws; i++) {
       info->mode = mode[i];
-      st_feedback_draw_vbo(ctx, info, 0, &draws[i], 1);
+      st_feedback_draw_vbo(ctx, info, 0, NULL, &draws[i], 1);
    }
 }

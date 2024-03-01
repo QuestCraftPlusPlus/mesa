@@ -201,7 +201,7 @@ vk_extent3d_el_to_px(const VkExtent3D extent_el,
 static bool
 isl_tiling_supports_standard_block_shapes(enum isl_tiling tiling)
 {
-   return tiling == ISL_TILING_64 ||
+   return isl_tiling_is_64(tiling) ||
           tiling == ISL_TILING_ICL_Ys ||
           tiling == ISL_TILING_SKL_Ys;
 }
@@ -593,6 +593,9 @@ anv_sparse_bind_trtt(struct anv_device *device,
 
    if (trtt_submit.l3l2_binds_len || trtt_submit.l1_binds_len)
       result = anv_genX(device->info, write_trtt_entries)(&trtt_submit);
+
+   if (result == VK_SUCCESS)
+      ANV_RMV(vm_binds, device, sparse_submit->binds, sparse_submit->binds_len);
 
 out:
    pthread_mutex_unlock(&trtt->mutex);
@@ -988,18 +991,50 @@ vk_bind_to_anv_vm_bind(struct anv_sparse_binding_data *sparse,
    return anv_bind;
 }
 
-VkResult
+static VkResult
 anv_sparse_bind_resource_memory(struct anv_device *device,
                                 struct anv_sparse_binding_data *sparse,
+                                uint64_t resource_size,
                                 const VkSparseMemoryBind *vk_bind,
                                 struct anv_sparse_submission *submit)
 {
    struct anv_vm_bind bind = vk_bind_to_anv_vm_bind(sparse, vk_bind);
+   uint64_t rem = vk_bind->size % ANV_SPARSE_BLOCK_SIZE;
 
-   if (vk_bind->size % ANV_SPARSE_BLOCK_SIZE != 0)
-      return vk_error(device, VK_ERROR_VALIDATION_FAILED_EXT);
+   if (rem != 0) {
+      if (vk_bind->resourceOffset + vk_bind->size == resource_size)
+         bind.size += ANV_SPARSE_BLOCK_SIZE - rem;
+      else
+         return vk_error(device, VK_ERROR_VALIDATION_FAILED_EXT);
+   }
 
    return anv_sparse_submission_add(device, submit, &bind);
+}
+
+VkResult
+anv_sparse_bind_buffer(struct anv_device *device,
+                       struct anv_buffer *buffer,
+                       const VkSparseMemoryBind *vk_bind,
+                       struct anv_sparse_submission *submit)
+{
+   return anv_sparse_bind_resource_memory(device, &buffer->sparse_data,
+                                          buffer->vk.size,
+                                          vk_bind, submit);
+}
+
+VkResult
+anv_sparse_bind_image_opaque(struct anv_device *device,
+                             struct anv_image *image,
+                             const VkSparseMemoryBind *vk_bind,
+                             struct anv_sparse_submission *submit)
+{
+   struct anv_image_binding *b =
+      &image->bindings[ANV_IMAGE_MEMORY_BINDING_MAIN];
+   assert(!image->disjoint);
+
+   return anv_sparse_bind_resource_memory(device, &b->sparse_data,
+                                          b->memory_range.size,
+                                          vk_bind, submit);
 }
 
 VkResult

@@ -45,8 +45,6 @@ astc_decoder_glsl_file = files('glsl/astc_decoder.glsl')
 files_libcompiler = files(
   'glsl_types.c',
   'glsl_types.h',
-  'glsl_types_impl.h',
-  'nir_types.h',
   'shader_enums.c',
   'shader_enums.h',
   'shader_info.h',
@@ -81,7 +79,7 @@ subdir('nir')
 
 subdir('spirv')
 
-if with_opencl_spirv
+if with_clc
   subdir('clc')
 endif
 if with_gallium

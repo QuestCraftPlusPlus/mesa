@@ -33,7 +33,7 @@ static const struct debug_control vn_debug_options[] = {
    { "log_ctx_info", VN_DEBUG_LOG_CTX_INFO },
    { "cache", VN_DEBUG_CACHE },
    { "no_sparse", VN_DEBUG_NO_SPARSE },
-   { "gpl", VN_DEBUG_GPL },
+   { "no_gpl", VN_DEBUG_NO_GPL },
    { NULL, 0 },
    /* clang-format on */
 };
@@ -47,15 +47,18 @@ static const struct debug_control vn_perf_options[] = {
    { "no_fence_feedback", VN_PERF_NO_FENCE_FEEDBACK },
    { "no_memory_suballoc", VN_PERF_NO_MEMORY_SUBALLOC },
    { "no_cmd_batching", VN_PERF_NO_CMD_BATCHING },
-   { "no_timeline_sem_feedback", VN_PERF_NO_TIMELINE_SEM_FEEDBACK },
+   { "no_semaphore_feedback", VN_PERF_NO_SEMAPHORE_FEEDBACK },
    { "no_query_feedback", VN_PERF_NO_QUERY_FEEDBACK },
    { "no_async_mem_alloc", VN_PERF_NO_ASYNC_MEM_ALLOC },
    { "no_tiled_wsi_image", VN_PERF_NO_TILED_WSI_IMAGE },
    { "no_multi_ring", VN_PERF_NO_MULTI_RING },
+   { "no_async_image_create", VN_PERF_NO_ASYNC_IMAGE_CREATE },
+   { "no_async_image_format", VN_PERF_NO_ASYNC_IMAGE_FORMAT },
    { NULL, 0 },
    /* clang-format on */
 };
 
+uint64_t vn_next_obj_id = 1;
 struct vn_env vn_env;
 
 static void
@@ -95,7 +98,7 @@ vn_env_init(void)
 void
 vn_trace_init(void)
 {
-#ifdef ANDROID
+#if DETECT_OS_ANDROID
    atrace_init();
 #else
    util_cpu_trace_init();
@@ -240,9 +243,84 @@ vn_relax(struct vn_relax_state *state)
    os_time_sleep(base_sleep_us << shift);
 }
 
+struct vn_ring *
+vn_tls_get_ring(struct vn_instance *instance)
+{
+   if (VN_PERF(NO_MULTI_RING))
+      return instance->ring.ring;
+
+   struct vn_tls *tls = vn_tls_get();
+   if (unlikely(!tls)) {
+      /* only allow to fallback on missing tls */
+      return instance->ring.ring;
+   }
+
+   /* look up tls_ring owned by instance */
+   list_for_each_entry(struct vn_tls_ring, tls_ring, &tls->tls_rings,
+                       tls_head) {
+      mtx_lock(&tls_ring->mutex);
+      if (tls_ring->instance == instance) {
+         mtx_unlock(&tls_ring->mutex);
+         assert(tls_ring->ring);
+         return tls_ring->ring;
+      }
+      mtx_unlock(&tls_ring->mutex);
+   }
+
+   struct vn_tls_ring *tls_ring = calloc(1, sizeof(*tls_ring));
+   if (!tls_ring)
+      return NULL;
+
+   /* keep the extra for potential roundtrip sync on tls ring */
+   static const size_t extra_size = sizeof(uint32_t);
+
+   /* only need a small ring for synchronous cmds on tls ring */
+   static const size_t buf_size = 16 * 1024;
+
+   /* single cmd can use the entire ring shmem on tls ring */
+   static const uint8_t direct_order = 0;
+
+   struct vn_ring_layout layout;
+   vn_ring_get_layout(buf_size, extra_size, &layout);
+
+   tls_ring->ring = vn_ring_create(instance, &layout, direct_order);
+   if (!tls_ring->ring) {
+      free(tls_ring);
+      return NULL;
+   }
+
+   mtx_init(&tls_ring->mutex, mtx_plain);
+   tls_ring->instance = instance;
+   list_add(&tls_ring->tls_head, &tls->tls_rings);
+   list_add(&tls_ring->vk_head, &instance->ring.tls_rings);
+
+   return tls_ring->ring;
+}
+
+void
+vn_tls_destroy_ring(struct vn_tls_ring *tls_ring)
+{
+   mtx_lock(&tls_ring->mutex);
+   if (tls_ring->ring) {
+      vn_ring_destroy(tls_ring->ring);
+      tls_ring->ring = NULL;
+      tls_ring->instance = NULL;
+      mtx_unlock(&tls_ring->mutex);
+   } else {
+      mtx_unlock(&tls_ring->mutex);
+      mtx_destroy(&tls_ring->mutex);
+      free(tls_ring);
+   }
+}
+
 static void
 vn_tls_free(void *tls)
 {
+   if (tls) {
+      list_for_each_entry_safe(struct vn_tls_ring, tls_ring,
+                               &((struct vn_tls *)tls)->tls_rings, tls_head)
+         vn_tls_destroy_ring(tls_ring);
+   }
    free(tls);
 }
 
@@ -270,9 +348,17 @@ vn_tls_get(void)
       return tls;
 
    tls = calloc(1, sizeof(*tls));
-   if (tls && tss_set(vn_tls_key, tls) == thrd_success)
-      return tls;
+   if (!tls)
+      return NULL;
 
-   free(tls);
-   return NULL;
+   /* initialize tls */
+   tls->async_pipeline_create = false;
+   list_inithead(&tls->tls_rings);
+
+   if (tss_set(vn_tls_key, tls) != thrd_success) {
+      free(tls);
+      return NULL;
+   }
+
+   return tls;
 }

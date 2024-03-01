@@ -149,7 +149,8 @@ struct fd_dev_info {
 
       /* Per CCU GMEM amount reserved for each of DEPTH and COLOR caches
        * in sysmem rendering. */
-      uint32_t sysmem_per_ccu_cache_size;
+      uint32_t sysmem_per_ccu_depth_cache_size;
+      uint32_t sysmem_per_ccu_color_cache_size;
       /* Per CCU GMEM amount reserved for color cache used by GMEM resolves
        * which require color cache (non-BLIT event case).
        * The size is expressed as a fraction of ccu cache used by sysmem
@@ -157,7 +158,7 @@ struct fd_dev_info {
        * to make sure it will not overwrite pixel data in GMEM that is still
        * needed.
        */
-      /* see enum a6xx_ccu_color_cache_size */
+      /* see enum a6xx_ccu_cache_size */
       uint32_t gmem_ccu_color_cache_fraction;
 
       /* Corresponds to HLSQ_CONTROL_1_REG::PRIMALLOCTHRESHOLD */
@@ -168,6 +169,15 @@ struct fd_dev_info {
       bool supports_double_threadsize;
 
       bool has_sampler_minmax;
+
+      bool broken_ds_ubwc_quirk;
+
+      /* Whether UBWC is supported on all IBOs. Prior to this, only readonly
+       * or writeonly IBOs could use UBWC and mixing reads and writes was not
+       * permitted.
+       */
+      bool supports_ibo_ubwc;
+
       struct {
          uint32_t PC_POWER_CNTL;
          uint32_t TPL1_DBG_ECO_CNTL;
@@ -182,12 +192,14 @@ struct fd_dev_info {
          uint32_t RB_UNKNOWN_8E01;
          uint32_t VPC_DBG_ECO_CNTL;
          uint32_t UCHE_UNKNOWN_0E12;
+
+         uint32_t RB_UNKNOWN_8E06;
       } magic;
 
       struct {
             uint32_t reg;
             uint32_t value;
-      } magic_raw[32];
+      } magic_raw[64];
 
       /* maximum number of descriptor sets */
       uint32_t max_sets;
@@ -206,6 +218,21 @@ struct fd_dev_info {
        * command buffers. We copy this dispatch as is.
        */
       bool cmdbuf_start_a725_quirk;
+
+      bool load_inline_uniforms_via_preamble_ldgk;
+      bool load_shader_consts_via_preamble;
+
+      bool has_gmem_vpc_attr_buf;
+      /* Size of buffer in gmem for VPC attributes */
+      uint32_t sysmem_vpc_attr_buf_size;
+      uint32_t gmem_vpc_attr_buf_size;
+
+      /* Whether the UBWC fast-clear values for snorn, unorm, and int formats
+       * are the same. This is the case from a740 onwards. These formats were
+       * already otherwise UBWC-compatible, so this means that they are now
+       * fully compatible.
+       */
+      bool ubwc_unorm_snorm_int_compatible;
    } a7xx;
 };
 

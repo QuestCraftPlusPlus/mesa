@@ -67,30 +67,12 @@ vn_dependency_info_has_present_src(uint32_t dep_count,
    return false;
 }
 
-static void *
-vn_cmd_get_tmp_data(struct vn_command_buffer *cmd, size_t size)
-{
-   struct vn_command_pool *pool = cmd->pool;
-   /* avoid shrinking in case of non efficient reallocation implementation */
-   if (size > pool->tmp.size) {
-      void *data =
-         vk_realloc(&pool->allocator, pool->tmp.data, size, VN_DEFAULT_ALIGN,
-                    VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
-      if (!data)
-         return NULL;
-
-      pool->tmp.data = data;
-      pool->tmp.size = size;
-   }
-
-   return pool->tmp.data;
-}
-
 static inline VkImageMemoryBarrier *
 vn_cmd_get_image_memory_barriers(struct vn_command_buffer *cmd,
                                  uint32_t count)
 {
-   return vn_cmd_get_tmp_data(cmd, count * sizeof(VkImageMemoryBarrier));
+   return vn_cached_storage_get(&cmd->pool->storage,
+                                count * sizeof(VkImageMemoryBarrier));
 }
 
 /* About VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, the spec says
@@ -403,7 +385,7 @@ vn_cmd_fix_dependency_infos(struct vn_command_buffer *cmd,
 
    size_t tmp_size = dep_count * sizeof(VkDependencyInfo) +
                      total_barrier_count * sizeof(VkImageMemoryBarrier2);
-   void *tmp = vn_cmd_get_tmp_data(cmd, tmp_size);
+   void *tmp = vn_cached_storage_get(&cmd->pool->storage, tmp_size);
    if (!tmp) {
       cmd->state = VN_COMMAND_BUFFER_STATE_INVALID;
       return dep_infos;
@@ -681,27 +663,18 @@ vn_CreateCommandPool(VkDevice device,
    pool->queue_family_index = pCreateInfo->queueFamilyIndex;
    list_inithead(&pool->command_buffers);
    list_inithead(&pool->free_query_batches);
-   list_inithead(&pool->free_query_feedback_cmds);
+
+   vn_cached_storage_init(&pool->storage, alloc);
 
    VkCommandPool pool_handle = vn_command_pool_to_handle(pool);
    vn_async_vkCreateCommandPool(dev->primary_ring, device, pCreateInfo, NULL,
                                 &pool_handle);
 
-   vn_tls_set_primary_ring_submission();
+   vn_tls_set_async_pipeline_create();
 
    *pCommandPool = pool_handle;
 
    return VK_SUCCESS;
-}
-
-static inline void
-vn_recycle_query_feedback_cmd(struct vn_command_buffer *cmd)
-{
-   vn_ResetCommandBuffer(
-      vn_command_buffer_to_handle(cmd->linked_query_feedback_cmd), 0);
-   list_add(&cmd->linked_query_feedback_cmd->feedback_head,
-            &cmd->linked_query_feedback_cmd->pool->free_query_feedback_cmds);
-   cmd->linked_query_feedback_cmd = NULL;
 }
 
 void
@@ -719,11 +692,6 @@ vn_DestroyCommandPool(VkDevice device,
 
    alloc = pAllocator ? pAllocator : &pool->allocator;
 
-   /* We must emit vkDestroyCommandPool before freeing the command buffers in
-    * pool->command_buffers.  Otherwise, another thread might reuse their
-    * object ids while they still refer to the command buffers in the
-    * renderer.
-    */
    vn_async_vkDestroyCommandPool(dev->primary_ring, device, commandPool,
                                  NULL);
 
@@ -739,8 +707,10 @@ vn_DestroyCommandPool(VkDevice device,
                                &cmd->builder.query_batches, head)
          vk_free(alloc, batch);
 
-      if (cmd->linked_query_feedback_cmd)
-         vn_recycle_query_feedback_cmd(cmd);
+      if (cmd->linked_qfb_cmd) {
+         vn_feedback_query_cmd_free(cmd->linked_qfb_cmd);
+         cmd->linked_qfb_cmd = NULL;
+      }
 
       vk_free(alloc, cmd);
    }
@@ -749,8 +719,7 @@ vn_DestroyCommandPool(VkDevice device,
                             &pool->free_query_batches, head)
       vk_free(alloc, batch);
 
-   if (pool->tmp.data)
-      vk_free(alloc, pool->tmp.data);
+   vn_cached_storage_fini(&pool->storage);
 
    vn_object_base_fini(&pool->base);
    vk_free(alloc, pool);
@@ -771,8 +740,10 @@ vn_cmd_reset(struct vn_command_buffer *cmd)
                             &cmd->builder.query_batches, head)
       list_move_to(&batch->head, &cmd->pool->free_query_batches);
 
-   if (cmd->linked_query_feedback_cmd)
-      vn_recycle_query_feedback_cmd(cmd);
+   if (cmd->linked_qfb_cmd) {
+      vn_feedback_query_cmd_free(cmd->linked_qfb_cmd);
+      cmd->linked_qfb_cmd = NULL;
+   }
 
    memset(&cmd->builder, 0, sizeof(cmd->builder));
 
@@ -791,6 +762,15 @@ vn_ResetCommandPool(VkDevice device,
    list_for_each_entry_safe(struct vn_command_buffer, cmd,
                             &pool->command_buffers, head)
       vn_cmd_reset(cmd);
+
+   if (flags & VK_COMMAND_POOL_RESET_RELEASE_RESOURCES_BIT) {
+      list_for_each_entry_safe(struct vn_feedback_query_batch, batch,
+                               &pool->free_query_batches, head)
+         vk_free(&pool->allocator, batch);
+
+      vn_cached_storage_fini(&pool->storage);
+      vn_cached_storage_init(&pool->storage, &pool->allocator);
+   }
 
    vn_async_vkResetCommandPool(dev->primary_ring, device, commandPool, flags);
 
@@ -891,8 +871,10 @@ vn_FreeCommandBuffers(VkDevice device,
                                &cmd->builder.query_batches, head)
          list_move_to(&batch->head, &cmd->pool->free_query_batches);
 
-      if (cmd->linked_query_feedback_cmd)
-         vn_recycle_query_feedback_cmd(cmd);
+      if (cmd->linked_qfb_cmd) {
+         vn_feedback_query_cmd_free(cmd->linked_qfb_cmd);
+         cmd->linked_qfb_cmd = NULL;
+      }
 
       vn_object_base_fini(&cmd->base);
       vk_free(alloc, cmd);
@@ -1616,7 +1598,7 @@ vn_CmdSetEvent(VkCommandBuffer commandBuffer,
 {
    VN_CMD_ENQUEUE(vkCmdSetEvent, commandBuffer, event, stageMask);
 
-   vn_feedback_event_cmd_record(commandBuffer, event, stageMask, VK_EVENT_SET,
+   vn_event_feedback_cmd_record(commandBuffer, event, stageMask, VK_EVENT_SET,
                                 false);
 }
 
@@ -1650,10 +1632,9 @@ vn_CmdSetEvent2(VkCommandBuffer commandBuffer,
 
    VN_CMD_ENQUEUE(vkCmdSetEvent2, commandBuffer, event, pDependencyInfo);
 
-   VkPipelineStageFlags2 src_stage_mask =
+   const VkPipelineStageFlags2 src_stage_mask =
       vn_dependency_info_collect_src_stage_mask(pDependencyInfo);
-
-   vn_feedback_event_cmd_record(commandBuffer, event, src_stage_mask,
+   vn_event_feedback_cmd_record(commandBuffer, event, src_stage_mask,
                                 VK_EVENT_SET, true);
 }
 
@@ -1664,7 +1645,7 @@ vn_CmdResetEvent(VkCommandBuffer commandBuffer,
 {
    VN_CMD_ENQUEUE(vkCmdResetEvent, commandBuffer, event, stageMask);
 
-   vn_feedback_event_cmd_record(commandBuffer, event, stageMask,
+   vn_event_feedback_cmd_record(commandBuffer, event, stageMask,
                                 VK_EVENT_RESET, false);
 }
 
@@ -1674,7 +1655,7 @@ vn_CmdResetEvent2(VkCommandBuffer commandBuffer,
                   VkPipelineStageFlags2 stageMask)
 {
    VN_CMD_ENQUEUE(vkCmdResetEvent2, commandBuffer, event, stageMask);
-   vn_feedback_event_cmd_record(commandBuffer, event, stageMask,
+   vn_event_feedback_cmd_record(commandBuffer, event, stageMask,
                                 VK_EVENT_RESET, true);
 }
 
@@ -1782,7 +1763,7 @@ vn_cmd_add_query_feedback(VkCommandBuffer cmd_handle,
    struct vn_command_buffer *cmd = vn_command_buffer_from_handle(cmd_handle);
    struct vn_query_pool *query_pool = vn_query_pool_from_handle(pool_handle);
 
-   if (!query_pool->feedback)
+   if (!query_pool->fb_buf)
       return;
 
    /* Per 1.3.255 spec "If queries are used while executing a render pass
@@ -1815,7 +1796,7 @@ vn_cmd_add_query_reset_feedback(VkCommandBuffer cmd_handle,
    struct vn_command_buffer *cmd = vn_command_buffer_from_handle(cmd_handle);
    struct vn_query_pool *query_pool = vn_query_pool_from_handle(pool_handle);
 
-   if (!query_pool->feedback)
+   if (!query_pool->fb_buf)
       return;
 
    struct vn_feedback_query_batch *batch = vn_cmd_query_batch_alloc(

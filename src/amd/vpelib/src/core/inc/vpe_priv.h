@@ -104,7 +104,7 @@ struct vpe_cmd_info {
 
 struct config_record {
     uint64_t config_base_addr;
-    int64_t  config_size;
+    uint64_t  config_size;
 };
 
 /** represents a stream input, i.e. common to all segments */
@@ -129,6 +129,7 @@ struct stream_ctx {
     enum color_space         cs;
     bool                     enable_3dlut;
     bool                     update_3dlut;
+    uint64_t                 UID_3DLUT;                 // UID for current 3D LUT params
 
     union {
         struct {

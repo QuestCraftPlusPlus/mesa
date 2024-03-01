@@ -29,11 +29,12 @@
 
 #include "isl/isl.h"
 
-struct brw_stage_prog_data;
-
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+struct brw_compiler;
+struct elk_compiler;
 
 enum blorp_op {
    BLORP_OP_BLIT,
@@ -65,7 +66,7 @@ struct blorp_context {
 
    const struct isl_device *isl_dev;
 
-   const struct brw_compiler *compiler;
+   struct blorp_compiler *compiler;
 
    bool enable_tbimr;
 
@@ -76,7 +77,7 @@ struct blorp_context {
                          uint32_t stage,
                          const void *key, uint32_t key_size,
                          const void *kernel, uint32_t kernel_size,
-                         const struct brw_stage_prog_data *prog_data,
+                         const void *prog_data,
                          uint32_t prog_data_size,
                          uint32_t *kernel_out, void *prog_data_out);
    void (*exec)(struct blorp_batch *batch, const struct blorp_params *params);
@@ -84,9 +85,16 @@ struct blorp_context {
    struct blorp_config config;
 };
 
-void blorp_init(struct blorp_context *blorp, void *driver_ctx,
-                struct isl_device *isl_dev, const struct blorp_config *config);
+void blorp_init_brw(struct blorp_context *blorp, void *driver_ctx,
+                    struct isl_device *isl_dev, const struct brw_compiler *brw,
+                    const struct blorp_config *config);
+
+void blorp_init_elk(struct blorp_context *blorp, void *driver_ctx,
+                    struct isl_device *isl_dev, const struct elk_compiler *brw,
+                    const struct blorp_config *config);
+
 void blorp_finish(struct blorp_context *blorp);
+
 
 enum blorp_batch_flags {
    /**

@@ -1388,22 +1388,22 @@ optimizations.extend([
    (('ishr', a, 0), a),
    (('ushr', 0, a), 0),
    (('ushr', a, 0), a),
-   (('ior', ('ishl@16', a, b), ('ushr@16', a, ('iadd', 16, ('ineg', b)))), ('urol', a, b), '!options->lower_rotate'),
-   (('ior', ('ishl@16', a, b), ('ushr@16', a, ('isub', 16, b))), ('urol', a, b), '!options->lower_rotate'),
-   (('ior', ('ishl@32', a, b), ('ushr@32', a, ('iadd', 32, ('ineg', b)))), ('urol', a, b), '!options->lower_rotate'),
-   (('ior', ('ishl@32', a, b), ('ushr@32', a, ('isub', 32, b))), ('urol', a, b), '!options->lower_rotate'),
-   (('ior', ('ushr@16', a, b), ('ishl@16', a, ('iadd', 16, ('ineg', b)))), ('uror', a, b), '!options->lower_rotate'),
-   (('ior', ('ushr@16', a, b), ('ishl@16', a, ('isub', 16, b))), ('uror', a, b), '!options->lower_rotate'),
-   (('ior', ('ushr@32', a, b), ('ishl@32', a, ('iadd', 32, ('ineg', b)))), ('uror', a, b), '!options->lower_rotate'),
-   (('ior', ('ushr@32', a, b), ('ishl@32', a, ('isub', 32, b))), ('uror', a, b), '!options->lower_rotate'),
-   (('urol@8',  a, b), ('ior', ('ishl', a, b), ('ushr', a, ('isub',  8, b))), 'options->lower_rotate'),
-   (('urol@16', a, b), ('ior', ('ishl', a, b), ('ushr', a, ('isub', 16, b))), 'options->lower_rotate'),
-   (('urol@32', a, b), ('ior', ('ishl', a, b), ('ushr', a, ('isub', 32, b))), 'options->lower_rotate'),
-   (('urol@64', a, b), ('ior', ('ishl', a, b), ('ushr', a, ('isub', 64, b))), 'options->lower_rotate'),
-   (('uror@8',  a, b), ('ior', ('ushr', a, b), ('ishl', a, ('isub',  8, b))), 'options->lower_rotate'),
-   (('uror@16', a, b), ('ior', ('ushr', a, b), ('ishl', a, ('isub', 16, b))), 'options->lower_rotate'),
-   (('uror@32', a, b), ('ior', ('ushr', a, b), ('ishl', a, ('isub', 32, b))), 'options->lower_rotate'),
-   (('uror@64', a, b), ('ior', ('ushr', a, b), ('ishl', a, ('isub', 64, b))), 'options->lower_rotate'),
+   (('ior', ('ishl@16', a, b), ('ushr@16', a, ('iadd', 16, ('ineg', b)))), ('urol', a, b), 'options->has_rotate16'),
+   (('ior', ('ishl@16', a, b), ('ushr@16', a, ('isub', 16, b))), ('urol', a, b), 'options->has_rotate16'),
+   (('ior', ('ishl@32', a, b), ('ushr@32', a, ('iadd', 32, ('ineg', b)))), ('urol', a, b), 'options->has_rotate32'),
+   (('ior', ('ishl@32', a, b), ('ushr@32', a, ('isub', 32, b))), ('urol', a, b), 'options->has_rotate32'),
+   (('ior', ('ushr@16', a, b), ('ishl@16', a, ('iadd', 16, ('ineg', b)))), ('uror', a, b), 'options->has_rotate16'),
+   (('ior', ('ushr@16', a, b), ('ishl@16', a, ('isub', 16, b))), ('uror', a, b), 'options->has_rotate16'),
+   (('ior', ('ushr@32', a, b), ('ishl@32', a, ('iadd', 32, ('ineg', b)))), ('uror', a, b), 'options->has_rotate32'),
+   (('ior', ('ushr@32', a, b), ('ishl@32', a, ('isub', 32, b))), ('uror', a, b), 'options->has_rotate32'),
+   (('urol@8',  a, b), ('ior', ('ishl', a, b), ('ushr', a, ('isub',  8, b))), '!options->has_rotate8'),
+   (('urol@16', a, b), ('ior', ('ishl', a, b), ('ushr', a, ('isub', 16, b))), '!options->has_rotate16'),
+   (('urol@32', a, b), ('ior', ('ishl', a, b), ('ushr', a, ('isub', 32, b))), '!options->has_rotate32'),
+   (('urol@64', a, b), ('ior', ('ishl', a, b), ('ushr', a, ('isub', 64, b)))),
+   (('uror@8',  a, b), ('ior', ('ushr', a, b), ('ishl', a, ('isub',  8, b))), '!options->has_rotate8'),
+   (('uror@16', a, b), ('ior', ('ushr', a, b), ('ishl', a, ('isub', 16, b))), '!options->has_rotate16'),
+   (('uror@32', a, b), ('ior', ('ushr', a, b), ('ishl', a, ('isub', 32, b))), '!options->has_rotate32'),
+   (('uror@64', a, b), ('ior', ('ushr', a, b), ('ishl', a, ('isub', 64, b)))),
 
    # bfi(X, a, b) = (b & ~X) | (a & X)
    # If X = ~0: (b & 0) | (a & 0xffffffff) = a
@@ -1443,9 +1443,14 @@ optimizations.extend([
     ('~fmul', ('fpow', a, b), ('fpow', c, d)), '!options->lower_fpow'), # 2^(lg2(a) * b + lg2(c) + d) = a^b * c^d
    (('~fexp2', ('fmul', ('flog2', a), 0.5)), ('fsqrt', a)),
    (('~fexp2', ('fmul', ('flog2', a), 2.0)), ('fmul', a, a)),
+   (('~fexp2', ('fmul', ('flog2', a), 3.0)), ('fmul', ('fmul', a, a), a)),
    (('~fexp2', ('fmul', ('flog2', a), 4.0)), ('fmul', ('fmul', a, a), ('fmul', a, a))),
+   (('~fexp2', ('fmul', ('flog2', a), 5.0)), ('fmul', ('fmul', ('fmul', a, a), ('fmul', a, a)), a)),
+   (('~fexp2', ('fmul', ('flog2', a), 6.0)), ('fmul', ('fmul', ('fmul', a, a), ('fmul', a, a)), ('fmul', a, a))),
+   (('~fexp2', ('fmul', ('flog2', a), 8.0)), ('fmul', ('fmul', ('fmul', a, a), ('fmul', a, a)), ('fmul', ('fmul', a, a), ('fmul', a, a)))),
    (('~fpow', a, 1.0), a),
    (('~fpow', a, 2.0), ('fmul', a, a)),
+   (('~fpow', a, 3.0), ('fmul', ('fmul', a, a), a)),
    (('~fpow', a, 4.0), ('fmul', ('fmul', a, a), ('fmul', a, a))),
    (('~fpow', 2.0, a), ('fexp2', a)),
    (('~fpow', ('fpow', a, 2.2), 0.454545), a),
@@ -2615,6 +2620,25 @@ optimizations += [
    (vkd3d_proton_packed_f2f16_rtz_lo('x', ('fabs', 'x')), ('pack_half_2x16_rtz_split', 'x', 0)),
    (vkd3d_proton_packed_f2f16_rtz_lo('x(is_not_negative)', 'x'), ('pack_half_2x16_rtz_split', 'x', 0)),
    (vkd3d_proton_packed_f2f16_rtz_lo(('fneg', 'x'), ('fabs', 'x')), ('pack_half_2x16_rtz_split', ('fneg', 'x'), 0)),
+]
+
+def vkd3d_proton_msad():
+   pattern = None
+   for i in range(4):
+      ref = ('extract_u8', 'a@32', i)
+      src = ('extract_u8', 'b@32', i)
+      sad = ('iabs', ('iadd', ref, ('ineg', src)))
+      msad = ('bcsel', ('ieq', ref, 0), 0, sad)
+      if pattern == None:
+         pattern = msad
+      else:
+         pattern = ('iadd', pattern, msad)
+   pattern = (pattern[0] + '(many-comm-expr)', *pattern[1:])
+   return pattern
+
+optimizations += [
+   (vkd3d_proton_msad(), ('msad_4x8', a, b, 0), 'options->has_msad'),
+   (('iadd', ('msad_4x8', a, b, 0), c), ('msad_4x8', a, b, c)),
 ]
 
 

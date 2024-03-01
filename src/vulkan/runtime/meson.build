@@ -96,6 +96,8 @@ vulkan_runtime_files = files(
   'vk_sampler.h',
   'vk_semaphore.c',
   'vk_semaphore.h',
+  'vk_shader.c',
+  'vk_shader.h',
   'vk_shader_module.c',
   'vk_shader_module.h',
   'vk_standard_sample_locations.c',
@@ -121,10 +123,13 @@ vulkan_runtime_files = files(
 vulkan_runtime_deps = [
   vulkan_wsi_deps,
   idep_mesautil,
-  idep_nir,
-  idep_vtn,
+  idep_nir_headers,
   idep_vulkan_util,
 ]
+
+if with_vk_compiler
+  vulkan_runtime_deps += [idep_nir, idep_vtn]
+endif
 
 if dep_libdrm.found()
   vulkan_runtime_files += files('vk_drm_syncobj.c', 'vk_drm_syncobj.h')

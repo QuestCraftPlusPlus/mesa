@@ -747,8 +747,13 @@ anv_cmd_buffer_alloc_dynamic_state(struct anv_cmd_buffer *cmd_buffer,
 {
    if (size == 0)
       return ANV_STATE_NULL;
+   assert(cmd_buffer->state.current_db_mode !=
+          ANV_CMD_DESCRIPTOR_BUFFER_MODE_UNKNOWN);
    struct anv_state state =
-      anv_state_stream_alloc(&cmd_buffer->dynamic_state_stream,
+      anv_state_stream_alloc(cmd_buffer->state.current_db_mode ==
+                             ANV_CMD_DESCRIPTOR_BUFFER_MODE_BUFFER ?
+                             &cmd_buffer->dynamic_state_db_stream :
+                             &cmd_buffer->dynamic_state_stream,
                              size, alignment);
    if (state.map == NULL)
       anv_batch_set_error(&cmd_buffer->batch, VK_ERROR_OUT_OF_DEVICE_MEMORY);
@@ -1248,8 +1253,7 @@ anv_cmd_buffer_exec_batch_debug(struct anv_queue *queue,
                                 uint32_t cmd_buffer_count,
                                 struct anv_cmd_buffer **cmd_buffers,
                                 struct anv_query_pool *perf_query_pool,
-                                uint32_t perf_query_pass,
-                                bool is_companion_rcs_cmd_buffer)
+                                uint32_t perf_query_pass)
 {
    if (!INTEL_DEBUG(DEBUG_BATCH | DEBUG_BATCH_STATS))
       return;
@@ -1277,13 +1281,8 @@ anv_cmd_buffer_exec_batch_debug(struct anv_queue *queue,
          }
       }
 
-      for (uint32_t i = 0; i < cmd_buffer_count; i++) {
-         struct anv_cmd_buffer *cmd_buffer =
-            is_companion_rcs_cmd_buffer ?
-            cmd_buffers[i]->companion_rcs_cmd_buffer :
-            cmd_buffers[i];
-         anv_print_batch(device, queue, cmd_buffer);
-      }
+      for (uint32_t i = 0; i < cmd_buffer_count; i++)
+         anv_print_batch(device, queue, cmd_buffers[i]);
    } else if (INTEL_DEBUG(DEBUG_BATCH)) {
       intel_print_batch(queue->decoder, device->trivial_batch_bo->map,
                         device->trivial_batch_bo->size,
@@ -1426,10 +1425,9 @@ anv_queue_submit_sparse_bind_locked(struct anv_queue *queue,
       assert(anv_buffer_is_sparse(buffer));
 
       for (uint32_t j = 0; j < bind_info->bindCount; j++) {
-         result = anv_sparse_bind_resource_memory(device,
-                                                  &buffer->sparse_data,
-                                                  &bind_info->pBinds[j],
-                                                  &sparse_submit);
+         result = anv_sparse_bind_buffer(device, buffer,
+                                         &bind_info->pBinds[j],
+                                         &sparse_submit);
          if (result != VK_SUCCESS)
             goto out_free_submit;
       }
@@ -1457,14 +1455,11 @@ anv_queue_submit_sparse_bind_locked(struct anv_queue *queue,
       ANV_FROM_HANDLE(anv_image, image, bind_info->image);
 
       assert(anv_image_is_sparse(image));
-      assert(!image->disjoint);
-      struct anv_sparse_binding_data *sparse_data =
-         &image->bindings[ANV_IMAGE_MEMORY_BINDING_MAIN].sparse_data;
 
       for (uint32_t j = 0; j < bind_info->bindCount; j++) {
-         result = anv_sparse_bind_resource_memory(device, sparse_data,
-                                                  &bind_info->pBinds[j],
-                                                  &sparse_submit);
+         result = anv_sparse_bind_image_opaque(device, image,
+                                               &bind_info->pBinds[j],
+                                               &sparse_submit);
          if (result != VK_SUCCESS)
             goto out_free_submit;
       }

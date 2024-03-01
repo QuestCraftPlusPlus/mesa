@@ -47,6 +47,7 @@ struct radv_shader_args {
 
    /* NGG */
    struct ac_arg ngg_provoking_vtx;
+   struct ac_arg ngg_lds_layout;
 
    /* NGG GS */
    struct ac_arg ngg_culling_settings;
@@ -86,6 +87,9 @@ struct radv_shader_args {
     */
    struct ac_arg tes_state;
 
+   /* GS */
+   struct ac_arg vgt_esgs_ring_itemsize;
+
    /* NGG VS streamout */
    struct ac_arg num_verts_per_prim;
 
@@ -106,10 +110,10 @@ radv_shader_args_from_ac(struct ac_shader_args *args)
    return container_of(args, struct radv_shader_args, ac);
 }
 
-struct radv_pipeline_key;
+struct radv_graphics_state_key;
 struct radv_shader_info;
 
-void radv_declare_shader_args(const struct radv_device *device, const struct radv_pipeline_key *key,
+void radv_declare_shader_args(const struct radv_device *device, const struct radv_graphics_state_key *gfx_state,
                               const struct radv_shader_info *info, gl_shader_stage stage,
                               gl_shader_stage previous_stage, struct radv_shader_args *args);
 

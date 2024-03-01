@@ -57,6 +57,8 @@ enum {
    DEBUG_LIVE_INFO = 0x100,
    DEBUG_FORCE_WAITDEPS = 0x200,
    DEBUG_NO_VALIDATE_IR = 0x400,
+   DEBUG_NO_SCHED_ILP = 0x800,
+   DEBUG_NO_SCHED_VOPD = 0x1000,
 };
 
 enum storage_class : uint8_t {
@@ -956,6 +958,7 @@ struct Pseudo_reduction_instruction;
 struct VALU_instruction;
 struct VINTERP_inreg_instruction;
 struct VINTRP_instruction;
+struct VOPD_instruction;
 struct DPP16_instruction;
 struct DPP8_instruction;
 struct SDWA_instruction;
@@ -1209,6 +1212,17 @@ struct Instruction {
       return *(VINTERP_inreg_instruction*)this;
    }
    constexpr bool isVINTERP_INREG() const noexcept { return format == Format::VINTERP_INREG; }
+   VOPD_instruction& vopd() noexcept
+   {
+      assert(isVOPD());
+      return *(VOPD_instruction*)this;
+   }
+   const VOPD_instruction& vopd() const noexcept
+   {
+      assert(isVOPD());
+      return *(VOPD_instruction*)this;
+   }
+   constexpr bool isVOPD() const noexcept { return format == Format::VOPD; }
    constexpr bool isVOP1() const noexcept { return (uint16_t)format & (uint16_t)Format::VOP1; }
    constexpr bool isVOP2() const noexcept { return (uint16_t)format & (uint16_t)Format::VOP2; }
    constexpr bool isVOPC() const noexcept { return (uint16_t)format & (uint16_t)Format::VOPC; }
@@ -1277,7 +1291,8 @@ struct Instruction {
    }
    constexpr bool isVALU() const noexcept
    {
-      return isVOP1() || isVOP2() || isVOPC() || isVOP3() || isVOP3P() || isVINTERP_INREG();
+      return isVOP1() || isVOP2() || isVOPC() || isVOP3() || isVOP3P() || isVINTERP_INREG() ||
+             isVOPD();
    }
 
    constexpr bool isSALU() const noexcept
@@ -1287,6 +1302,7 @@ struct Instruction {
 
    constexpr bool isVMEM() const noexcept { return isMTBUF() || isMUBUF() || isMIMG(); }
 
+   bool accessesLDS() const noexcept;
    bool isTrans() const noexcept;
 };
 static_assert(sizeof(Instruction) == 16, "Unexpected padding");
@@ -1365,6 +1381,12 @@ struct VINTERP_inreg_instruction : public VALU_instruction {
 };
 static_assert(sizeof(VINTERP_inreg_instruction) == sizeof(VALU_instruction) + 4,
               "Unexpected padding");
+
+struct VOPD_instruction : public VALU_instruction {
+   aco_opcode opy;
+   uint16_t padding;
+};
+static_assert(sizeof(VOPD_instruction) == sizeof(VALU_instruction) + 4, "Unexpected padding");
 
 /**
  * Data Parallel Primitives Format:
@@ -1674,6 +1696,12 @@ struct Pseudo_reduction_instruction : public Instruction {
 static_assert(sizeof(Pseudo_reduction_instruction) == sizeof(Instruction) + 4,
               "Unexpected padding");
 
+inline bool
+Instruction::accessesLDS() const noexcept
+{
+   return (isDS() && !ds().gds) || isLDSDIR() || isVINTRP();
+}
+
 inline void
 VALU_instruction::swapOperands(unsigned idx0, unsigned idx1)
 {
@@ -1799,6 +1827,8 @@ bool can_swap_operands(aco_ptr<Instruction>& instr, aco_opcode* new_op, unsigned
 uint32_t get_reduction_identity(ReduceOp op, unsigned idx);
 
 unsigned get_mimg_nsa_dwords(const Instruction* instr);
+
+unsigned get_vopd_opy_start(const Instruction* instr);
 
 unsigned get_operand_size(aco_ptr<Instruction>& instr, unsigned index);
 
@@ -2175,10 +2205,6 @@ void select_tcs_epilog(Program* program, void* pinfo, ac_shader_config* config,
                        const struct aco_compiler_options* options,
                        const struct aco_shader_info* info, const struct ac_shader_args* args);
 
-void select_gl_vs_prolog(Program* program, void* pinfo, ac_shader_config* config,
-                         const struct aco_compiler_options* options,
-                         const struct aco_shader_info* info, const struct ac_shader_args* args);
-
 void select_ps_prolog(Program* program, void* pinfo, ac_shader_config* config,
                       const struct aco_compiler_options* options,
                       const struct aco_shader_info* info, const struct ac_shader_args* args);
@@ -2200,6 +2226,8 @@ void register_allocation(Program* program, std::vector<IDSet>& live_out_per_bloc
 void ssa_elimination(Program* program);
 void lower_to_hw_instr(Program* program);
 void schedule_program(Program* program, live& live_vars);
+void schedule_ilp(Program* program);
+void schedule_vopd(Program* program);
 void spill(Program* program, live& live_vars);
 void insert_wait_states(Program* program);
 bool dealloc_vgprs(Program* program);

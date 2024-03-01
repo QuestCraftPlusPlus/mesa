@@ -817,7 +817,7 @@ struct zink_shader {
    unsigned num_texel_buffers;
    uint32_t ubos_used; // bitfield of which ubo indices are used
    uint32_t ssbos_used; // bitfield of which ssbo indices are used
-   uint32_t flat_flags;
+   uint64_t flat_flags;
    bool bindless;
    bool can_inline;
    bool has_uniforms;
@@ -1360,6 +1360,9 @@ struct zink_resource {
       };
    };
 
+   VkRect2D damage;
+   bool use_damage;
+
    bool copies_warned;
    bool swapchain;
    bool dmabuf;
@@ -1416,6 +1419,10 @@ struct zink_screen {
    simple_mtx_t copy_context_lock;
    struct zink_context *copy_context;
 
+   struct zink_batch_state *free_batch_states; //unused batch states
+   struct zink_batch_state *last_free_batch_state; //for appending
+   simple_mtx_t free_batch_states_lock;
+
    simple_mtx_t semaphores_lock;
    struct util_dynarray semaphores;
    struct util_dynarray fd_semaphores;
@@ -1430,6 +1437,7 @@ struct zink_screen {
    bool device_lost;
    int drm_fd;
 
+   struct slab_mempool present_mempool;
    struct slab_parent_pool transfer_pool;
    struct disk_cache *disk_cache;
    struct util_queue cache_put_thread;
@@ -1515,7 +1523,7 @@ struct zink_screen {
    bool renderdoc_capture_all;
 #endif
 
-   struct vk_dispatch_table vk;
+   struct vk_uncompacted_dispatch_table vk;
 
    void (*buffer_barrier)(struct zink_context *ctx, struct zink_resource *res, VkAccessFlags flags, VkPipelineStageFlags pipeline);
    void (*image_barrier)(struct zink_context *ctx, struct zink_resource *res, VkImageLayout new_layout, VkAccessFlags flags, VkPipelineStageFlags pipeline);
@@ -1526,7 +1534,6 @@ struct zink_screen {
 
    struct {
       bool dual_color_blend_by_location;
-      bool glsl_correct_derivatives_after_discard;
       bool inline_uniforms;
       bool emulate_point_smooth;
       bool zink_shader_object_enable;
@@ -1680,6 +1687,7 @@ struct zink_sampler_view {
    union {
       struct zink_surface *image_view;
       struct zink_buffer_view *buffer_view;
+      unsigned tbo_size;
    };
    struct zink_surface *cube_array;
    /* Optional sampler view returning red (depth) in all channels, for shader rewrites. */
@@ -1926,6 +1934,9 @@ struct zink_context {
       bool inverted;
       bool active; //this is the internal vk state
    } render_condition;
+   struct {
+      uint64_t render_passes;
+   } hud;
 
    struct {
       bool valid;
@@ -2010,6 +2021,7 @@ struct zink_context {
          uint16_t any_bindless_dirty;
       };
       bool bindless_refs_dirty;
+      bool null_fbfetch_init;
    } di;
    void (*invalidate_descriptor_state)(struct zink_context *ctx, gl_shader_stage shader, enum zink_descriptor_type type, unsigned, unsigned);
    struct set *need_barriers[2]; //gfx, compute
@@ -2032,6 +2044,7 @@ struct zink_context {
    bool unordered_blitting : 1;
    bool vertex_state_changed : 1;
    bool blend_state_changed : 1;
+   bool blend_color_changed : 1;
    bool sample_mask_changed : 1;
    bool rast_state_changed : 1;
    bool line_width_changed : 1;
