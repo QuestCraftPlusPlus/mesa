@@ -912,6 +912,7 @@ add_gpus([
         GPUId(740), # Deprecated, used for dev kernels.
         GPUId(chip_id=0x43050a01, name="FD740"), # KGSL, no speedbin data
         GPUId(chip_id=0xffff43050a01, name="FD740"), # Default no-speedbin fallback
+	GPUId(chip_id=0x43050B00, name="FD740"), # Adreno 740v3 moment
     ], A6xxGPUInfo(
         CHIP.A7XX,
         [a7xx_base, a7xx_740],
@@ -932,7 +933,7 @@ add_gpus([
             # corruption in some tests.
             PC_MODE_CNTL = 0x0000003f,
             SP_DBG_ECO_CNTL = 0x10000000,
-            RB_DBG_ECO_CNTL = 0x00000000,
+            RB_DBG_ECO_CNTL = 0x1,
             RB_DBG_ECO_CNTL_blit = 0x00000000,  # is it even needed?
             # HLSQ_DBG_ECO_CNTL = 0x0,
             RB_UNKNOWN_8E01 = 0x0,
